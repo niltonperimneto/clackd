@@ -1,0 +1,92 @@
+# clackd — VIA-first async keyboard daemon (systemd user unit).
+#
+# Install location:
+#   /usr/lib/systemd/user/clackd.service   (system-wide)
+#   ~/.config/systemd/user/clackd.service  (per-user)
+#
+# Enable & start:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now clackd.service
+#
+# This is a USER unit by design — the daemon is session-scoped per
+# CLAUDE.md §6, connecting to the session D-Bus. A future system-bus
+# migration requires a polkit policy file and an authorization model
+# update; do not convert to a system unit without both.
+
+[Unit]
+Description=clackd — VIA-first async keyboard daemon
+Documentation=https://github.com/clackd/clackd
+# We talk to the session bus, so wait for it to be available.
+Requires=dbus.socket
+After=dbus.socket
+
+[Service]
+# Type=notify: the binary calls sd_notify(READY=1) once the D-Bus name
+# is acquired and the object server is reachable. systemd treats the
+# unit as activating until that signal arrives.
+Type=notify
+NotifyAccess=main
+
+# The daemon refuses to run as root by design (CLAUDE.md §6). systemd
+# user units already run as the invoking user; nothing extra needed here.
+ExecStart=/usr/bin/clackd
+
+# Restart policy. The supervisor is itself fault-tolerant, but if the
+# whole process dies (panic in main, OOM, etc.) we want a fresh start.
+Restart=on-failure
+RestartSec=5s
+
+# Filesystem hardening — the daemon writes nothing outside its own
+# state directory ($XDG_DATA_HOME/clackd, used by the legacy shadow
+# cache in Mission 4+). Reads its config from $XDG_CONFIG_HOME/clackd.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+# Kernel surface hardening. The daemon does not need any of these.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Capabilities — the daemon runs unprivileged. Drop everything.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Device access. PrivateDevices=true would hide /dev/hidraw*, so we
+# narrow the allow-list instead.
+PrivateDevices=false
+DeviceAllow=char-hidraw rw
+DeviceAllow=char-usb_device rw
+
+# Syscall filter. Default-deny with the "system-service" group is the
+# canonical systemd recipe for a network/IPC daemon.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Resource limits. The daemon is intentionally tiny — it allocates
+# zero on the HID hot path (SKILLS.md §3.1) and bounded amounts on
+# coalescing flushes.
+MemoryHigh=64M
+MemoryMax=128M
+TasksMax=64
+
+# Environment. RUST_LOG drives tracing_subscriber's EnvFilter at
+# startup; tweak per deployment.
+Environment=RUST_LOG=info
+# CLACKD_VIA_COALESCE_MS enables the opt-in write-coalescing buffer
+# (CLAUDE.md §4.1). Off by default; uncomment to enable.
+#Environment=CLACKD_VIA_COALESCE_MS=250
+
+[Install]
+WantedBy=default.target

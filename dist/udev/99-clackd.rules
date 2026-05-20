@@ -1,0 +1,12 @@
+# /etc/udev/rules.d/99-clackd.rules
+#
+# Udev rules for clackd to allow unprivileged access to VIA/QMK keyboards.
+# This grants access to the physically logged-in user via the 'uaccess' tag.
+
+# Match any USB device exposing the raw HID interface (bInterfaceClass="03") 
+# that VIA keyboards use, and grant access to the active user (uaccess).
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{bInterfaceClass}=="03", ATTRS{bInterfaceSubClass}=="00", ATTRS{bInterfaceProtocol}=="00", TAG+="uaccess"
+
+# Additionally, explicitly match the Akko Keyboard (Vendor 0xfffe, Product 0x000b)
+# as a fallback if the generic interface matcher isn't granular enough.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="fffe", ATTRS{idProduct}=="000b", TAG+="uaccess"

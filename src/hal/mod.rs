@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 //! Hardware Abstraction Layer — VIA-first keyboard driver contract.
@@ -53,12 +54,15 @@
 //! and the [`DriverError`] type. Concrete backends live in sibling modules:
 //!
 //! - `via.rs` — QMK/VIA native raw-HID implementation.
-//! - `legacy/` — shadow-state polyfill drivers for non-VIA hardware.
+//! - `legacy/` — shadow-state polyfill drivers for non-VIA hardware
+//!   (TODO mission-4; vendor protocol research pending).
 
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use thiserror::Error;
+
+pub mod via;
 
 /// Errors raised by [`KeyboardDriver`] implementations.
 ///
@@ -283,6 +287,12 @@ pub trait KeyboardDriver: Send + Sync {
         keycode: u16,
     ) -> Result<(), DriverError>;
 
+    /// Extended Configuration (VIA protocol specific mappings)
+    async fn get_macro_buffer(&mut self, offset: u16, length: u8) -> Result<Vec<u8>, DriverError>;
+    async fn set_macro_buffer(&mut self, offset: u16, data: &[u8]) -> Result<(), DriverError>;
+    async fn get_lighting(&mut self, lighting_cmd: u8) -> Result<Vec<u8>, DriverError>;
+    async fn set_lighting(&mut self, lighting_cmd: u8, data: &[u8]) -> Result<(), DriverError>;
+
     /// Forces durability of any pending writes.
     ///
     /// **Context:** Cancel-safe. Callers should treat this as best-effort
@@ -307,4 +317,20 @@ pub trait KeyboardDriver: Send + Sync {
     ///   compilation fails. On failure, legacy drivers must roll the shadow
     ///   cache back to its last-known-good state per CLAUDE.md §4.2.
     async fn commit_to_nvram(&mut self) -> Result<(), DriverError>;
+
+    /// Whether each successful `set_keycode` call should trigger a
+    /// `LayoutUpdated` lifecycle event from the engine worker.
+    ///
+    /// **Context:** In unbuffered mode (VIA-first default), every write
+    /// is immediately persistent on hardware, so the engine emits
+    /// `LayoutUpdated` on each successful `set_keycode`. In coalescing
+    /// mode, writes are batched — the coalescer itself emits the event
+    /// after a successful flush. Returning `false` suppresses the
+    /// per-call emission so the event fires exactly once per flush.
+    ///
+    /// The default implementation returns `true`, which is correct for
+    /// all unbuffered backends.
+    fn emits_layout_event_per_set(&self) -> bool {
+        true
+    }
 }

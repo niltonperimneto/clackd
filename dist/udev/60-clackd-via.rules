@@ -1,0 +1,50 @@
+# udev rules for clackd — grant the active session unprivileged access
+# to VIA-capable keyboards over hidraw.
+#
+# Install location:
+#   /etc/udev/rules.d/60-clackd-via.rules
+#
+# After installing (or editing) this file:
+#   sudo udevadm control --reload
+#   sudo udevadm trigger
+#
+# # Why this is needed
+#
+# `clackd` runs as a regular user (CLAUDE.md §6). For it to read and
+# write /dev/hidrawX nodes without CAP_SYS_RAWIO, udev must grant the
+# active login session an ACL on the node. The `TAG+="uaccess"` mark is
+# what triggers that ACL — see systemd-logind(8) and udev(7).
+#
+# # Why per-device rules
+#
+# VIA is a firmware feature, not a vendor or USB-class identifier. The
+# kernel exposes USB VID/PID to udev but does NOT expose HID Usage Page
+# (which is what distinguishes VIA endpoints — page 0xFF60). Daemon
+# itself probes the descriptor at attach time, but udev can only filter
+# coarsely.
+#
+# # Recommended approach
+#
+# Add one line per keyboard you want clackd to manage. The VID/PID can
+# be read from `lsusb` or from `udevadm info /dev/hidrawN`.
+#
+# Examples (uncomment and adjust the IDs to match your hardware):
+#
+#   # Drop ALT — vid 04d8 pid eed3
+#   #SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="eed3", TAG+="uaccess"
+#
+#   # Keychron K2 V2 — vid 3434 pid 0151
+#   #SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3434", ATTRS{idProduct}=="0151", TAG+="uaccess"
+#
+#   # Generic placeholder
+#   #SUBSYSTEM=="hidraw", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", TAG+="uaccess"
+#
+# # Permissive alternative (NOT recommended)
+#
+# If you want every hidraw node to be session-accessible — handy for
+# discovery but loose on security. The daemon will still refuse to
+# attach to non-VIA devices thanks to its Usage Page probe, but other
+# applications on the session will also be able to open mice, joysticks, etc.
+
+SUBSYSTEM=="hidraw", TAG+="uaccess"
+

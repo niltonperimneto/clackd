@@ -1,0 +1,23 @@
+# D-Bus session-bus activation file for clackd.
+#
+# Install location:
+#   /usr/share/dbus-1/services/io.github.clackd.service        (system-wide)
+#   ~/.local/share/dbus-1/services/io.github.clackd.service    (per-user)
+#
+# Effect: when any client calls a method on `io.github.clackd` and the
+# daemon is not already running, the session bus launches it via the
+# referenced systemd user unit. The bus then waits for the unit to
+# report ready (`Type=notify` + `READY=1`) before routing the original
+# method call to it.
+#
+# This file is OPTIONAL — without it the daemon must be started
+# explicitly via `systemctl --user start clackd.service` (or run from
+# the shell). With it, the daemon becomes lazily-activated.
+
+[D-BUS Service]
+Name=io.github.clackd
+SystemdService=clackd.service
+# Exec is required by the D-Bus spec but is only used when SystemdService
+# is unavailable (e.g. systemd-less containers). Match the unit's
+# ExecStart path.
+Exec=/usr/bin/clackd

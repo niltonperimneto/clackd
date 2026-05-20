@@ -12,41 +12,43 @@
 #     * sync: mpsc + oneshot channels for the actor pattern (SKILLS.md §1.1).
 #     * time: timeout deadlines and exponential-backoff sleeps (SKILLS.md §2.2).
 #     * io-util: AsyncReadExt / AsyncWriteExt helpers for AsyncFd consumers.
-#     * net: pulled in transitively by AsyncFd; declared explicitly so the
-#       feature graph is auditable.
-#     * fs: ONLY for XDG_DATA_HOME path materialization in the legacy shadow
-#       cache (CLAUDE.md §4.2). Tokio fs is FORBIDDEN for hidraw character
-#       devices — see CLAUDE.md §4.1.
-#     * signal: SIGTERM/SIGINT handling in the supervisor.
+#     * net: pulled in transitively by AsyncFd; explicitly declared.
+#     * fs: ONLY for XDG_DATA_HOME path materialization. Tokio fs is FORBIDDEN for hidraw.
+#     * signal: SIGTERM/SIGINT handling.
 #
-# - zbus: Session-bus IPC frontend (CLAUDE.md §5). default-features = false
-#   plus the "tokio" feature keeps the runtime single — avoids dragging in
-#   async-io / async-executor, which would fork the executor model.
-#
-# - thiserror: Derives for DriverError / DaemonError. Zero runtime cost; the
-#   error boundary in CLAUDE.md §3.3 mandates well-typed enums, not anyhow.
-#
-# - tracing: Structured logging. Required by CLAUDE.md §4.1 ("logged at INFO
-#   level on activation" of the coalescing buffer); also the supervisor and
-#   reconnection backoff path needs spans.
-#
-# - serde / serde_json: Legacy shadow-state persistence to
-#   $XDG_DATA_HOME/clackd/<device_id>.json (CLAUDE.md §4.2). Not used by the
-#   VIA driver.
-#
-# - async-trait: Required by the KeyboardDriver trait (CLAUDE.md §3.2).
-#   Acknowledged debt — each call boxes a future. Migration to native async
-#   fn in traits (RPITIT) is gated on MSRV ≥ 1.75 per the architecture's
-#   migration note; revisit once bulk-remap throughput becomes the bottleneck.
-#
-# Deliberately deferred to the missions that need them (NOT added speculatively):
-#   tokio-udev, nix, xdg / directories, zerocopy, polkit bindings.
+# - zbus: Session-bus IPC frontend. default-features = false, tokio feature keeps runtime single.
+# - thiserror: Derives for DriverError / DaemonError.
+# - tracing: Structured logging.
+# - tracing-subscriber: Structured log sink registration.
+# - serde / serde_json: Legacy shadow-state persistence.
+# - async-trait: Required by KeyboardDriver trait.
+
+
+[package]
+name = "clackd"
+version = "0.0.3"
+edition = "2024"
+rust-version = "1.95.0"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "signal"] }
+tokio-stream = "0.1.18"
+tokio-udev = "0.10"
+nix = { version = "0.31", features = ["fs", "ioctl"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
+# sd-notify: emit READY=1 / STOPPING=1 to systemd when running under
+# Type=notify. When NOTIFY_SOCKET is unset (non-systemd runs), every call
+# is a cheap no-op — no conditional compilation required.
+sd-notify = "0.5"
+toml = "1.1.2"
+directories = "6"
+# clap: argument parser for the `clackctl` CLI binary (src/bin/clackctl.rs).
+# Only the CLI uses it; the daemon does not. Shared at the package level.
+clap = { version = "4", features = ["derive"] }
