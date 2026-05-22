@@ -209,13 +209,24 @@ impl ClackdInterface {
         inner.map_err(zbus::fdo::Error::from)
     }
 
-    /// Lighting/RGB configuration
-    async fn get_lighting(&self, device_id: &str, command: u8) -> zbus::fdo::Result<Vec<u8>> {
+    /// Reads a VIA custom value `(channel, value_id)` — RGB/backlight config.
+    ///
+    /// **Context:** `channel` is the VIA custom channel (QMK RGB-matrix = 3,
+    /// RGBLIGHT = 2, backlight = 1); `value_id` selects the field
+    /// (brightness = 1, effect = 2, speed = 3, colour = 4). Returns the
+    /// raw value bytes.
+    async fn get_lighting(
+        &self,
+        device_id: &str,
+        channel: u8,
+        value_id: u8,
+    ) -> zbus::fdo::Result<Vec<u8>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.engine_tx
             .send(EngineCommand::GetLighting {
                 device_id: device_id.to_owned(),
-                command,
+                channel,
+                value_id,
                 reply: reply_tx,
             })
             .await
@@ -226,12 +237,24 @@ impl ClackdInterface {
         inner.map_err(zbus::fdo::Error::from)
     }
 
-    async fn set_lighting(&self, device_id: &str, command: u8, data: Vec<u8>) -> zbus::fdo::Result<()> {
+    /// Writes a VIA custom value `(channel, value_id)` — RGB/backlight config.
+    ///
+    /// **Context:** Applies live; not persisted to EEPROM unless a separate
+    /// save is issued (not currently exposed). See [`Self::get_lighting`]
+    /// for the channel/value_id meanings.
+    async fn set_lighting(
+        &self,
+        device_id: &str,
+        channel: u8,
+        value_id: u8,
+        data: Vec<u8>,
+    ) -> zbus::fdo::Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.engine_tx
             .send(EngineCommand::SetLighting {
                 device_id: device_id.to_owned(),
-                command,
+                channel,
+                value_id,
                 data,
                 reply: reply_tx,
             })

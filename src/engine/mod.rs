@@ -264,11 +264,13 @@ enum WorkerOp {
         reply: oneshot::Sender<Result<(), DaemonError>>,
     },
     GetLighting {
-        command: u8,
+        channel: u8,
+        value_id: u8,
         reply: oneshot::Sender<Result<Vec<u8>, DaemonError>>,
     },
     SetLighting {
-        command: u8,
+        channel: u8,
+        value_id: u8,
         data: Vec<u8>,
         reply: oneshot::Sender<Result<(), DaemonError>>,
     },
@@ -418,11 +420,11 @@ async fn handle_command(
         EngineCommand::SetMacro { device_id, offset, data, reply } => {
             dispatch_macro_set(registry, device_id, offset, data, reply);
         }
-        EngineCommand::GetLighting { device_id, command, reply } => {
-            dispatch_lighting_get(registry, device_id, command, reply);
+        EngineCommand::GetLighting { device_id, channel, value_id, reply } => {
+            dispatch_lighting_get(registry, device_id, channel, value_id, reply);
         }
-        EngineCommand::SetLighting { device_id, command, data, reply } => {
-            dispatch_lighting_set(registry, device_id, command, data, reply);
+        EngineCommand::SetLighting { device_id, channel, value_id, data, reply } => {
+            dispatch_lighting_set(registry, device_id, channel, value_id, data, reply);
         }
         EngineCommand::DeviceConnected { device_id, vendor_id, product_id, hidraw_path } => {
             registry.reconnecting.remove(&device_id);
@@ -641,14 +643,15 @@ fn dispatch_macro_set(
 fn dispatch_lighting_get(
     registry: &mut DeviceRegistry,
     device_id: String,
-    command: u8,
+    channel: u8,
+    value_id: u8,
     reply: oneshot::Sender<Result<Vec<u8>, DaemonError>>,
 ) {
     let Some(handle) = registry.devices.get(&device_id) else {
         let _ = reply.send(Err(DaemonError::DeviceNotFound { device_id }));
         return;
     };
-    let op = WorkerOp::GetLighting { command, reply };
+    let op = WorkerOp::GetLighting { channel, value_id, reply };
     if let Err(send_err) = handle.tx.try_send(op) {
         surface_worker_send_failure(send_err, &device_id, registry);
     }
@@ -657,7 +660,8 @@ fn dispatch_lighting_get(
 fn dispatch_lighting_set(
     registry: &mut DeviceRegistry,
     device_id: String,
-    command: u8,
+    channel: u8,
+    value_id: u8,
     data: Vec<u8>,
     reply: oneshot::Sender<Result<(), DaemonError>>,
 ) {
@@ -665,7 +669,7 @@ fn dispatch_lighting_set(
         let _ = reply.send(Err(DaemonError::DeviceNotFound { device_id }));
         return;
     };
-    let op = WorkerOp::SetLighting { command, data, reply };
+    let op = WorkerOp::SetLighting { channel, value_id, data, reply };
     if let Err(send_err) = handle.tx.try_send(op) {
         surface_worker_send_failure(send_err, &device_id, registry);
     }
@@ -844,18 +848,18 @@ async fn run_device_worker(
                 let _ = reply.send(result);
                 is_fatal
             }
-            WorkerOp::GetLighting { command, reply } => {
+            WorkerOp::GetLighting { channel, value_id, reply } => {
                 let result = driver
-                    .get_lighting(command)
+                    .get_lighting(channel, value_id)
                     .await
                     .map_err(DaemonError::from);
                 let is_fatal = is_fatal_driver_error(&result);
                 let _ = reply.send(result);
                 is_fatal
             }
-            WorkerOp::SetLighting { command, data, reply } => {
+            WorkerOp::SetLighting { channel, value_id, data, reply } => {
                 let result = driver
-                    .set_lighting(command, &data)
+                    .set_lighting(channel, value_id, &data)
                     .await
                     .map_err(DaemonError::from);
                 let is_fatal = is_fatal_driver_error(&result);
@@ -1002,8 +1006,8 @@ mod tests {
         async fn commit_to_nvram(&mut self) -> Result<(), DriverError> { Ok(()) }
         async fn get_macro_buffer(&mut self, _offset: u16, length: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; length as usize]) }
         async fn set_macro_buffer(&mut self, _offset: u16, _data: &[u8]) -> Result<(), DriverError> { Ok(()) }
-        async fn get_lighting(&mut self, _lighting_cmd: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; 4]) }
-        async fn set_lighting(&mut self, _lighting_cmd: u8, _data: &[u8]) -> Result<(), DriverError> { Ok(()) }
+        async fn get_lighting(&mut self, _channel: u8, _value_id: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; 4]) }
+        async fn set_lighting(&mut self, _channel: u8, _value_id: u8, _data: &[u8]) -> Result<(), DriverError> { Ok(()) }
     }
 
     /// Test-only harness: returns the four parameters every `handle_command`

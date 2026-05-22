@@ -135,13 +135,15 @@ async fn main() -> Result<(), BootError> {
         info!("shutdown signal received");
         notify_systemd_stopping();
 
-        // Signal the engine supervisor to gracefully shut down.
-        // It will drop all device workers which breaks the cycle and allows
-        // engine_rx to naturally return None once we drop our sender clones.
+        // Signal the engine supervisor to gracefully shut down. It clears
+        // its registry (dropping every worker's command channel, which
+        // terminates the workers) and breaks its loop — this is what
+        // resolves the circular sender ownership (the supervisor holds an
+        // engine_tx clone, as do the workers), which channel-closure alone
+        // cannot break.
         let _ = engine_tx.send(EngineCommand::Shutdown).await;
 
-        // Drop the *last* sender clones we still hold so the supervisor's
-        // `engine_rx.recv()` returns `None` and the IPC signal pump's
+        // Drop the last sender clones we hold so the IPC signal pump's
         // broadcast receiver sees `Closed`.
         drop(engine_tx);
         drop(lifecycle_tx);

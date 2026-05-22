@@ -95,13 +95,18 @@ const VIA_FRAME_LEN: usize = 32;
 /// byte; the kernel ignores it on devices without report IDs.
 const VIA_HIDRAW_REPORT_ID: u8 = 0x00;
 
+// VIA command IDs — values are fixed by QMK's `quantum/via.h` enum
+// `via_command_id`. Do NOT guess these: 0x0B is `id_bootloader_jump`,
+// which drops the board into DFU mode, and 0x0A is `id_eeprom_reset`.
 const ID_DYNAMIC_KEYMAP_GET_KEYCODE: u8 = 0x04;
 const ID_DYNAMIC_KEYMAP_SET_KEYCODE: u8 = 0x05;
 const ID_DYNAMIC_KEYMAP_GET_LAYER_COUNT: u8 = 0x11;
-const ID_LIGHTING_GET_VALUE: u8 = 0x07;
-const ID_LIGHTING_SET_VALUE: u8 = 0x08;
-const ID_MACRO_GET_BUFFER: u8 = 0x0B;
-const ID_MACRO_SET_BUFFER: u8 = 0x0C;
+// Lighting maps onto VIA's "custom value" channel: 0x07 sets, 0x08 gets.
+const ID_LIGHTING_SET_VALUE: u8 = 0x07; // id_custom_set_value
+const ID_LIGHTING_GET_VALUE: u8 = 0x08; // id_custom_get_value
+// Dynamic-keymap macro buffer: 0x0E reads, 0x0F writes.
+const ID_MACRO_GET_BUFFER: u8 = 0x0E; // id_dynamic_keymap_macro_get_buffer
+const ID_MACRO_SET_BUFFER: u8 = 0x0F; // id_dynamic_keymap_macro_set_buffer
 
 /// Default per-round-trip deadline.
 ///
@@ -344,21 +349,36 @@ impl CoalescerTransport for ViaTransport {
         Ok(())
     }
 
-    async fn get_lighting(&mut self, lighting_cmd: u8) -> Result<Vec<u8>, DriverError> {
+    async fn get_lighting(&mut self, channel: u8, value_id: u8) -> Result<Vec<u8>, DriverError> {
         let mut req = [0u8; VIA_FRAME_LEN];
-        req[0] = ID_LIGHTING_GET_VALUE;
-        req[1] = lighting_cmd;
+        req[0] = ID_LIGHTING_GET_VALUE; // id_custom_get_value (0x08)
+        req[1] = channel;
+        req[2] = value_id;
         let resp = self.roundtrip(req, "get_lighting").await?;
-        // Return the whole frame minus the report ID
-        Ok(resp[1..].to_vec())
+        // Firmware echoes [0x08, channel, value_id, value...]. Validate the
+        // echo so a desynced frame surfaces as a protocol violation rather
+        // than silently returning the wrong value.
+        if resp[0] != ID_LIGHTING_GET_VALUE || resp[1] != channel || resp[2] != value_id {
+            return Err(DriverError::ProtocolViolation {
+                reason: "(cmd, channel, value_id) echo mismatch on get_lighting",
+            });
+        }
+        // Return the value bytes following the echoed channel + value_id.
+        Ok(resp[3..].to_vec())
     }
 
-    async fn set_lighting(&mut self, lighting_cmd: u8, data: &[u8]) -> Result<(), DriverError> {
+    async fn set_lighting(
+        &mut self,
+        channel: u8,
+        value_id: u8,
+        data: &[u8],
+    ) -> Result<(), DriverError> {
         let mut req = [0u8; VIA_FRAME_LEN];
-        req[0] = ID_LIGHTING_SET_VALUE;
-        req[1] = lighting_cmd;
-        let max_len = std::cmp::min(data.len(), VIA_FRAME_LEN - 2);
-        req[2..2 + max_len].copy_from_slice(&data[..max_len]);
+        req[0] = ID_LIGHTING_SET_VALUE; // id_custom_set_value (0x07)
+        req[1] = channel;
+        req[2] = value_id;
+        let max_len = std::cmp::min(data.len(), VIA_FRAME_LEN - 3);
+        req[3..3 + max_len].copy_from_slice(&data[..max_len]);
         self.roundtrip(req, "set_lighting").await?;
         Ok(())
     }
@@ -388,8 +408,13 @@ pub(crate) trait CoalescerTransport: Send + Sync + 'static {
     async fn get_layer_count(&mut self) -> Result<u8, DriverError>;
     async fn get_macro_buffer(&mut self, offset: u16, length: u8) -> Result<Vec<u8>, DriverError>;
     async fn set_macro_buffer(&mut self, offset: u16, data: &[u8]) -> Result<(), DriverError>;
-    async fn get_lighting(&mut self, lighting_cmd: u8) -> Result<Vec<u8>, DriverError>;
-    async fn set_lighting(&mut self, lighting_cmd: u8, data: &[u8]) -> Result<(), DriverError>;
+    async fn get_lighting(&mut self, channel: u8, value_id: u8) -> Result<Vec<u8>, DriverError>;
+    async fn set_lighting(
+        &mut self,
+        channel: u8,
+        value_id: u8,
+        data: &[u8],
+    ) -> Result<(), DriverError>;
 }
 
 /// Commands sent into the coalescer actor.
@@ -425,11 +450,13 @@ enum CoalescerOp {
         reply: oneshot::Sender<Result<(), DriverError>>,
     },
     GetLighting {
-        command: u8,
+        channel: u8,
+        value_id: u8,
         reply: oneshot::Sender<Result<Vec<u8>, DriverError>>,
     },
     SetLighting {
-        command: u8,
+        channel: u8,
+        value_id: u8,
         data: Vec<u8>,
         reply: oneshot::Sender<Result<(), DriverError>>,
     },
@@ -523,11 +550,11 @@ async fn run_coalescer<T: CoalescerTransport>(
                     CoalescerOp::SetMacro { offset, data, reply } => {
                         let _ = reply.send(transport.set_macro_buffer(offset, &data).await);
                     }
-                    CoalescerOp::GetLighting { command, reply } => {
-                        let _ = reply.send(transport.get_lighting(command).await);
+                    CoalescerOp::GetLighting { channel, value_id, reply } => {
+                        let _ = reply.send(transport.get_lighting(channel, value_id).await);
                     }
-                    CoalescerOp::SetLighting { command, data, reply } => {
-                        let _ = reply.send(transport.set_lighting(command, &data).await);
+                    CoalescerOp::SetLighting { channel, value_id, data, reply } => {
+                        let _ = reply.send(transport.set_lighting(channel, value_id, &data).await);
                     }
                 }
             }
@@ -761,13 +788,13 @@ impl KeyboardDriver for ViaDriver {
         }
     }
 
-    async fn get_lighting(&mut self, lighting_cmd: u8) -> Result<Vec<u8>, DriverError> {
+    async fn get_lighting(&mut self, channel: u8, value_id: u8) -> Result<Vec<u8>, DriverError> {
         match &mut self.inner {
-            ViaInner::Direct(t) => t.get_lighting(lighting_cmd).await,
+            ViaInner::Direct(t) => t.get_lighting(channel, value_id).await,
             ViaInner::Coalesced { op_tx, .. } => {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 op_tx
-                    .send(CoalescerOp::GetLighting { command: lighting_cmd, reply: reply_tx })
+                    .send(CoalescerOp::GetLighting { channel, value_id, reply: reply_tx })
                     .await
                     .map_err(|_| DriverError::Disconnected)?;
                 reply_rx.await.map_err(|_| DriverError::Disconnected)?
@@ -775,13 +802,18 @@ impl KeyboardDriver for ViaDriver {
         }
     }
 
-    async fn set_lighting(&mut self, lighting_cmd: u8, data: &[u8]) -> Result<(), DriverError> {
+    async fn set_lighting(
+        &mut self,
+        channel: u8,
+        value_id: u8,
+        data: &[u8],
+    ) -> Result<(), DriverError> {
         match &mut self.inner {
-            ViaInner::Direct(t) => t.set_lighting(lighting_cmd, data).await,
+            ViaInner::Direct(t) => t.set_lighting(channel, value_id, data).await,
             ViaInner::Coalesced { op_tx, .. } => {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 op_tx
-                    .send(CoalescerOp::SetLighting { command: lighting_cmd, data: data.to_vec(), reply: reply_tx })
+                    .send(CoalescerOp::SetLighting { channel, value_id, data: data.to_vec(), reply: reply_tx })
                     .await
                     .map_err(|_| DriverError::Disconnected)?;
                 reply_rx.await.map_err(|_| DriverError::Disconnected)?
@@ -1018,6 +1050,23 @@ mod tests {
     }
 
     #[test]
+    fn via_command_ids_match_canonical_protocol() {
+        // These MUST match QMK `quantum/via.h` `via_command_id`. A wrong
+        // value is not just incorrect — it is dangerous: 0x0A is
+        // `id_eeprom_reset` and 0x0B is `id_bootloader_jump`. A prior
+        // revision had ID_MACRO_GET_BUFFER = 0x0B, which would have
+        // dropped the board into DFU mode on a read. This test pins the
+        // values so that regression cannot recur silently.
+        assert_eq!(ID_DYNAMIC_KEYMAP_GET_KEYCODE, 0x04);
+        assert_eq!(ID_DYNAMIC_KEYMAP_SET_KEYCODE, 0x05);
+        assert_eq!(ID_LIGHTING_SET_VALUE, 0x07, "id_custom_set_value");
+        assert_eq!(ID_LIGHTING_GET_VALUE, 0x08, "id_custom_get_value");
+        assert_eq!(ID_MACRO_GET_BUFFER, 0x0E, "id_dynamic_keymap_macro_get_buffer");
+        assert_eq!(ID_MACRO_SET_BUFFER, 0x0F, "id_dynamic_keymap_macro_set_buffer");
+        assert_eq!(ID_DYNAMIC_KEYMAP_GET_LAYER_COUNT, 0x11);
+    }
+
+    #[test]
     fn test_via_descriptor_matches() {
         assert!(hid_descriptor_has_usage_page(&via_descriptor(), VIA_USAGE_PAGE));
     }
@@ -1120,10 +1169,15 @@ mod tests {
         async fn set_macro_buffer(&mut self, _offset: u16, _data: &[u8]) -> Result<(), DriverError> {
             Ok(())
         }
-        async fn get_lighting(&mut self, _lighting_cmd: u8) -> Result<Vec<u8>, DriverError> {
+        async fn get_lighting(&mut self, _channel: u8, _value_id: u8) -> Result<Vec<u8>, DriverError> {
             Ok(vec![0; 4])
         }
-        async fn set_lighting(&mut self, _lighting_cmd: u8, _data: &[u8]) -> Result<(), DriverError> {
+        async fn set_lighting(
+            &mut self,
+            _channel: u8,
+            _value_id: u8,
+            _data: &[u8],
+        ) -> Result<(), DriverError> {
             Ok(())
         }
     }

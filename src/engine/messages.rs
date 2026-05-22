@@ -209,12 +209,14 @@ pub(crate) enum EngineCommand {
     },
     GetLighting {
         device_id: String,
-        command: u8,
+        channel: u8,
+        value_id: u8,
         reply: oneshot::Sender<Result<Vec<u8>, DaemonError>>,
     },
     SetLighting {
         device_id: String,
-        command: u8,
+        channel: u8,
+        value_id: u8,
         data: Vec<u8>,
         reply: oneshot::Sender<Result<(), DaemonError>>,
     },

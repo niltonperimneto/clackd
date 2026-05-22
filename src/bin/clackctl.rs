@@ -66,9 +66,9 @@ trait Clackd {
     /// Write macro buffer bytes at `offset`.
     fn set_macro(&self, device_id: &str, offset: u16, data: Vec<u8>) -> zbus::Result<()>;
     /// Read a lighting/RGB configuration value.
-    fn get_lighting(&self, device_id: &str, command: u8) -> zbus::Result<Vec<u8>>;
+    fn get_lighting(&self, device_id: &str, channel: u8, value_id: u8) -> zbus::Result<Vec<u8>>;
     /// Write a lighting/RGB configuration value.
-    fn set_lighting(&self, device_id: &str, command: u8, data: Vec<u8>) -> zbus::Result<()>;
+    fn set_lighting(&self, device_id: &str, channel: u8, value_id: u8, data: Vec<u8>) -> zbus::Result<()>;
 
     /// Emitted when a layout change is finalized.
     #[zbus(signal)]
@@ -153,16 +153,20 @@ enum Command {
     GetLighting {
         /// Device id or numeric index.
         device: String,
-        /// VIA lighting sub-command byte (decimal or 0x hex).
-        command: String,
+        /// VIA custom channel (decimal or 0x hex): RGB-matrix=3, RGBLIGHT=2, backlight=1.
+        channel: String,
+        /// Value id within the channel: brightness=1, effect=2, speed=3, colour=4.
+        value_id: String,
     },
     /// Write a lighting/RGB configuration value.
     SetLighting {
         /// Device id or numeric index.
         device: String,
-        /// VIA lighting sub-command byte (decimal or 0x hex).
-        command: String,
-        /// Hex-encoded data bytes (e.g. `"FF8000"`).
+        /// VIA custom channel (decimal or 0x hex): RGB-matrix=3, RGBLIGHT=2, backlight=1.
+        channel: String,
+        /// Value id within the channel: brightness=1, effect=2, speed=3, colour=4.
+        value_id: String,
+        /// Hex-encoded value bytes (e.g. `"FF"` brightness, `"AABB"` hue+sat).
         data: String,
     },
     /// Stream device and layout lifecycle events until interrupted.
@@ -204,11 +208,11 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::SetMacro { device, offset, data } => {
             cmd_set_macro(&proxy, &device, &offset, &data).await
         }
-        Command::GetLighting { device, command } => {
-            cmd_get_lighting(&proxy, &device, &command).await
+        Command::GetLighting { device, channel, value_id } => {
+            cmd_get_lighting(&proxy, &device, &channel, &value_id).await
         }
-        Command::SetLighting { device, command, data } => {
-            cmd_set_lighting(&proxy, &device, &command, &data).await
+        Command::SetLighting { device, channel, value_id, data } => {
+            cmd_set_lighting(&proxy, &device, &channel, &value_id, &data).await
         }
         Command::Monitor => cmd_monitor(&proxy).await,
     }
@@ -393,11 +397,13 @@ async fn cmd_set_macro(
 async fn cmd_get_lighting(
     proxy: &ClackdProxy<'_>,
     device: &str,
-    command: &str,
+    channel: &str,
+    value_id: &str,
 ) -> Result<(), CliError> {
     let id = resolve_device(proxy, device).await?;
-    let cmd = parse_u8(command)?;
-    let data = proxy.get_lighting(&id, cmd).await?;
+    let ch = parse_u8(channel)?;
+    let vid = parse_u8(value_id)?;
+    let data = proxy.get_lighting(&id, ch, vid).await?;
     let hex: Vec<String> = data.iter().map(|b| format!("{b:02x}")).collect();
     println!("{}", hex.join(" "));
     Ok(())
@@ -406,13 +412,15 @@ async fn cmd_get_lighting(
 async fn cmd_set_lighting(
     proxy: &ClackdProxy<'_>,
     device: &str,
-    command: &str,
+    channel: &str,
+    value_id: &str,
     data: &str,
 ) -> Result<(), CliError> {
     let id = resolve_device(proxy, device).await?;
-    let cmd = parse_u8(command)?;
+    let ch = parse_u8(channel)?;
+    let vid = parse_u8(value_id)?;
     let bytes = parse_hex_bytes(data)?;
-    proxy.set_lighting(&id, cmd, bytes).await?;
+    proxy.set_lighting(&id, ch, vid, bytes).await?;
     println!("ok");
     Ok(())
 }
