@@ -156,6 +156,7 @@ pub(crate) enum EngineCommand {
     DeviceReattached {
         device_id: String,
         handle: crate::engine::DeviceHandle,
+        token: u64,
     },
 
     // --- Introspection (CLI / clackctl) ---

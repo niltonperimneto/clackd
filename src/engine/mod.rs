@@ -284,7 +284,7 @@ enum WorkerOp {
 /// [`EngineCommand::DeviceError`], and channel-closed detection on
 /// `try_send` covers the race where a worker dies between command dispatch
 /// and the next supervisor tick.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DeviceHandle {
     /// Dimensions reported by the device at attach time. Cached for the
     /// session per the cache-once-on-attach pattern documented on
@@ -305,7 +305,8 @@ pub(crate) struct DeviceHandle {
 #[derive(Default)]
 pub struct DeviceRegistry {
     devices: HashMap<String, DeviceHandle>,
-    reconnecting: HashMap<String, oneshot::Sender<()>>,
+    reconnecting: HashMap<String, (oneshot::Sender<()>, u64)>,
+    next_reconnect_token: u64,
 }
 
 impl DeviceRegistry {
@@ -476,7 +477,7 @@ async fn handle_command(
             }
         }
         EngineCommand::DeviceDisconnected { device_id } => {
-            if let Some(cancel) = registry.reconnecting.remove(&device_id) {
+            if let Some((cancel, _token)) = registry.reconnecting.remove(&device_id) {
                 let _ = cancel.send(());
             }
             if registry.devices.remove(&device_id).is_some() {
@@ -493,7 +494,9 @@ async fn handle_command(
                 if let DaemonError::Driver(DriverError::Disconnected) = *e {
                     info!(device_id, "device disconnected, starting reconnection backoff");
                     let (cancel_tx, cancel_rx) = oneshot::channel();
-                    registry.reconnecting.insert(device_id.clone(), cancel_tx);
+                    let token = registry.next_reconnect_token;
+                    registry.next_reconnect_token = registry.next_reconnect_token.wrapping_add(1);
+                    registry.reconnecting.insert(device_id.clone(), (cancel_tx, token));
                     tokio::spawn(reconnect_task(
                         ReconnectCtx {
                             device_id,
@@ -503,23 +506,31 @@ async fn handle_command(
                             driver_table: driver_table.clone(),
                             engine_tx: engine_tx.clone(),
                             lifecycle_tx: lifecycle_tx.clone(),
+                            token,
                         },
                         cancel_rx,
                     ));
                 }
             }
         }
-        EngineCommand::DeviceReattached { device_id, handle } => {
-            registry.reconnecting.remove(&device_id);
-            info!(
-                device_id,
-                rows = handle.topology.matrix.rows,
-                cols = handle.topology.matrix.cols,
-                layers = handle.topology.layer_count,
-                "device reattached after backoff",
-            );
-            registry.devices.insert(device_id.clone(), handle);
-            let _ = lifecycle_tx.send(LifecycleEvent::DeviceAdded(device_id));
+        EngineCommand::DeviceReattached { device_id, handle, token } => {
+            match registry.reconnecting.get(&device_id) {
+                Some((_, current_token)) if *current_token == token => {
+                    registry.reconnecting.remove(&device_id);
+                    info!(
+                        device_id,
+                        rows = handle.topology.matrix.rows,
+                        cols = handle.topology.matrix.cols,
+                        layers = handle.topology.layer_count,
+                        "device reattached after backoff",
+                    );
+                    registry.devices.insert(device_id.clone(), handle);
+                    let _ = lifecycle_tx.send(LifecycleEvent::DeviceAdded(device_id));
+                }
+                _ => {
+                    debug!(device_id, expected_token = ?registry.reconnecting.get(&device_id).map(|t| t.1), actual_token = token, "DeviceReattached ignored (token mismatch or reconnect cancelled)");
+                }
+            }
         }
         EngineCommand::ListDevices { reply } => {
             let mut ids: Vec<String> = registry.devices.keys().cloned().collect();
@@ -912,6 +923,7 @@ struct ReconnectCtx {
     driver_table: std::sync::Arc<DriverTable>,
     engine_tx: mpsc::Sender<EngineCommand>,
     lifecycle_tx: broadcast::Sender<LifecycleEvent>,
+    token: u64,
 }
 
 async fn reconnect_task(
@@ -958,7 +970,16 @@ async fn reconnect_task(
                 .await
                 {
                     Ok(handle) => {
-                        let _ = ctx.engine_tx.send(EngineCommand::DeviceReattached { device_id: ctx.device_id, handle }).await;
+                        // Check if cancelled before sending
+                        if !matches!(cancel_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                            info!(ctx.device_id, "reconnection succeeded but task was cancelled — discarding handle");
+                            return;
+                        }
+                        let _ = ctx.engine_tx.send(EngineCommand::DeviceReattached {
+                            device_id: ctx.device_id,
+                            handle,
+                            token: ctx.token,
+                        }).await;
                         return;
                     }
                     Err(e) => {
@@ -1086,5 +1107,83 @@ mod tests {
             &mut registry, &tx, &dt, &lt,
         ).await;
         assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reattach_token_matching() {
+        let mut registry = DeviceRegistry::new();
+        let (tx, dt, lt) = harness();
+
+        // 1. Setup a reconnect state with a token.
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        registry.reconnecting.insert("dev1".into(), (cancel_tx, 42));
+
+        // Create a dummy DeviceHandle to use for reattachment.
+        let (worker_tx, _) = mpsc::channel(1);
+        let handle = DeviceHandle {
+            topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            tx: worker_tx,
+            vendor_id: 0,
+            product_id: 0,
+            hidraw_path: PathBuf::new(),
+        };
+
+        // 2. Dispatch DeviceReattached with a mismatching token (e.g. 41).
+        handle_command(
+            EngineCommand::DeviceReattached {
+                device_id: "dev1".into(),
+                handle: handle.clone(),
+                token: 41,
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        // Verify it was ignored: device not added, and reconnect state is still present.
+        assert!(registry.devices.is_empty());
+        assert!(registry.reconnecting.contains_key("dev1"));
+        assert_eq!(registry.reconnecting.get("dev1").unwrap().1, 42);
+
+        // 3. Dispatch DeviceReattached with matching token (42).
+        handle_command(
+            EngineCommand::DeviceReattached {
+                device_id: "dev1".into(),
+                handle,
+                token: 42,
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        // Verify it succeeded: device added, reconnect state removed.
+        assert_eq!(registry.len(), 1);
+        assert!(registry.devices.contains_key("dev1"));
+        assert!(!registry.reconnecting.contains_key("dev1"));
+    }
+
+    #[tokio::test]
+    async fn test_reattach_without_reconnect_state() {
+        let mut registry = DeviceRegistry::new();
+        let (tx, dt, lt) = harness();
+
+        // DeviceReattached arrives but there is no entry in reconnecting.
+        let (worker_tx, _) = mpsc::channel(1);
+        let handle = DeviceHandle {
+            topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            tx: worker_tx,
+            vendor_id: 0,
+            product_id: 0,
+            hidraw_path: PathBuf::new(),
+        };
+
+        handle_command(
+            EngineCommand::DeviceReattached {
+                device_id: "dev1".into(),
+                handle,
+                token: 0,
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        // Verify it was ignored.
+        assert!(registry.devices.is_empty());
     }
 }
