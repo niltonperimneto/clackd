@@ -76,12 +76,11 @@ use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{broadcast, mpsc, oneshot};
-
-use crate::engine::LifecycleEvent;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, timeout, Instant};
 use tracing::{debug, info, trace, warn};
 
+use crate::engine::LifecycleEvent;
 use crate::hal::{DriverError, KeyboardDriver};
 
 /// VIA wire-frame length. Fixed by the protocol; never changes between
@@ -107,6 +106,14 @@ const ID_LIGHTING_GET_VALUE: u8 = 0x08; // id_custom_get_value
 // Dynamic-keymap macro buffer: 0x0E reads, 0x0F writes.
 const ID_MACRO_GET_BUFFER: u8 = 0x0E; // id_dynamic_keymap_macro_get_buffer
 const ID_MACRO_SET_BUFFER: u8 = 0x0F; // id_dynamic_keymap_macro_set_buffer
+
+/// Max macro bytes per frame: 32 − [cmd, off_hi, off_lo, size] = 28.
+/// QMK's firmware rejects sizes above this with a `0xFF` marker, so we
+/// reject early rather than silently truncating.
+const MAX_MACRO_CHUNK: usize = VIA_FRAME_LEN - 4;
+
+/// Max lighting value bytes per frame: 32 − [cmd, channel, value_id] = 29.
+const MAX_LIGHTING_VALUE: usize = VIA_FRAME_LEN - 3;
 
 /// Default per-round-trip deadline.
 ///
@@ -152,6 +159,45 @@ struct HidrawReportDescriptor {
 
 nix::ioctl_read!(hidiocgrdescsize, b'H', 0x01, std::os::raw::c_int);
 nix::ioctl_read!(hidiocgrdesc, b'H', 0x02, HidrawReportDescriptor);
+
+/// Validates that a response frame begins with the expected echo bytes.
+///
+/// **Context:** VIA firmware echoes the leading bytes of every request
+/// (command id, then operands) back in the response. A mismatch means the
+/// command-id state machine has desynced — surfaced as
+/// [`DriverError::ProtocolViolation`] rather than silently trusting the
+/// frame. `expected` is always short (≤ 6 bytes) and never exceeds
+/// [`VIA_FRAME_LEN`].
+fn validate_echo(
+    resp: &[u8; VIA_FRAME_LEN],
+    expected: &[u8],
+    reason: &'static str,
+) -> Result<(), DriverError> {
+    if resp[..expected.len()] == *expected {
+        Ok(())
+    } else {
+        Err(DriverError::ProtocolViolation { reason })
+    }
+}
+
+/// Builds a [`CoalescerOp`], sends it to the actor, and awaits the reply.
+///
+/// **Context:** Collapses the otherwise-identical request/response dance
+/// that every [`ViaDriver`] method performs in coalescing mode. A closed
+/// channel (actor gone) or a dropped reply both map to
+/// [`DriverError::Disconnected`] — from the engine's perspective the
+/// device is no longer reachable.
+async fn relay<R>(
+    op_tx: &mpsc::Sender<CoalescerOp>,
+    build: impl FnOnce(oneshot::Sender<Result<R, DriverError>>) -> CoalescerOp,
+) -> Result<R, DriverError> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    op_tx
+        .send(build(reply_tx))
+        .await
+        .map_err(|_| DriverError::Disconnected)?;
+    reply_rx.await.map_err(|_| DriverError::Disconnected)?
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ViaTransport — the hardware-touching component
@@ -257,15 +303,11 @@ impl CoalescerTransport for ViaTransport {
         req[2] = row;
         req[3] = col;
         let resp = self.roundtrip(req, "get_keycode").await?;
-        if resp[0] != ID_DYNAMIC_KEYMAP_GET_KEYCODE
-            || resp[1] != layer
-            || resp[2] != row
-            || resp[3] != col
-        {
-            return Err(DriverError::ProtocolViolation {
-                reason: "(cmd, layer, row, col) echo mismatch on get_keycode",
-            });
-        }
+        validate_echo(
+            &resp,
+            &[ID_DYNAMIC_KEYMAP_GET_KEYCODE, layer, row, col],
+            "(cmd, layer, row, col) echo mismatch on get_keycode",
+        )?;
         let keycode = u16::from_be_bytes([resp[4], resp[5]]);
         trace!(device_id = %self.device_id, layer, row, col, keycode, "get_keycode");
         Ok(keycode)
@@ -287,17 +329,11 @@ impl CoalescerTransport for ViaTransport {
         req[4] = kc_hi;
         req[5] = kc_lo;
         let resp = self.roundtrip(req, "set_keycode").await?;
-        if resp[0] != ID_DYNAMIC_KEYMAP_SET_KEYCODE
-            || resp[1] != layer
-            || resp[2] != row
-            || resp[3] != col
-            || resp[4] != kc_hi
-            || resp[5] != kc_lo
-        {
-            return Err(DriverError::ProtocolViolation {
-                reason: "(cmd, layer, row, col, keycode) echo mismatch on set_keycode",
-            });
-        }
+        validate_echo(
+            &resp,
+            &[ID_DYNAMIC_KEYMAP_SET_KEYCODE, layer, row, col, kc_hi, kc_lo],
+            "(cmd, layer, row, col, keycode) echo mismatch on set_keycode",
+        )?;
         trace!(device_id = %self.device_id, layer, row, col, keycode, "set_keycode");
         Ok(())
     }
@@ -321,6 +357,14 @@ impl CoalescerTransport for ViaTransport {
     }
 
     async fn get_macro_buffer(&mut self, offset: u16, length: u8) -> Result<Vec<u8>, DriverError> {
+        // VIA replies with [cmd, off_hi, off_lo, size, <size bytes>]; a
+        // single frame can carry at most MAX_MACRO_CHUNK payload bytes, and
+        // the firmware rejects larger requests. Callers chunk larger reads.
+        if length as usize > MAX_MACRO_CHUNK {
+            return Err(DriverError::ProtocolViolation {
+                reason: "macro read length exceeds 28-byte frame capacity",
+            });
+        }
         let mut req = [0u8; VIA_FRAME_LEN];
         req[0] = ID_MACRO_GET_BUFFER;
         let [off_hi, off_lo] = offset.to_be_bytes();
@@ -328,23 +372,23 @@ impl CoalescerTransport for ViaTransport {
         req[2] = off_lo;
         req[3] = length;
         let resp = self.roundtrip(req, "get_macro_buffer").await?;
-        // Protocol specifies we read `length` bytes after command echoes
-        // Actually VIA just returns the buffer starting at byte 4.
-        let mut result = Vec::with_capacity(length as usize);
-        let max_len = std::cmp::min(length as usize, VIA_FRAME_LEN - 4);
-        result.extend_from_slice(&resp[4..4 + max_len]);
-        Ok(result)
+        // Payload begins at byte 4, after the echoed cmd + offset + size.
+        Ok(resp[4..4 + length as usize].to_vec())
     }
 
     async fn set_macro_buffer(&mut self, offset: u16, data: &[u8]) -> Result<(), DriverError> {
+        if data.len() > MAX_MACRO_CHUNK {
+            return Err(DriverError::ProtocolViolation {
+                reason: "macro write chunk exceeds 28-byte frame capacity",
+            });
+        }
         let mut req = [0u8; VIA_FRAME_LEN];
         req[0] = ID_MACRO_SET_BUFFER;
         let [off_hi, off_lo] = offset.to_be_bytes();
         req[1] = off_hi;
         req[2] = off_lo;
-        let max_len = std::cmp::min(data.len(), VIA_FRAME_LEN - 4);
-        req[3] = max_len as u8;
-        req[4..4 + max_len].copy_from_slice(&data[..max_len]);
+        req[3] = data.len() as u8;
+        req[4..4 + data.len()].copy_from_slice(data);
         self.roundtrip(req, "set_macro_buffer").await?;
         Ok(())
     }
@@ -355,14 +399,12 @@ impl CoalescerTransport for ViaTransport {
         req[1] = channel;
         req[2] = value_id;
         let resp = self.roundtrip(req, "get_lighting").await?;
-        // Firmware echoes [0x08, channel, value_id, value...]. Validate the
-        // echo so a desynced frame surfaces as a protocol violation rather
-        // than silently returning the wrong value.
-        if resp[0] != ID_LIGHTING_GET_VALUE || resp[1] != channel || resp[2] != value_id {
-            return Err(DriverError::ProtocolViolation {
-                reason: "(cmd, channel, value_id) echo mismatch on get_lighting",
-            });
-        }
+        // Firmware echoes [0x08, channel, value_id, value...].
+        validate_echo(
+            &resp,
+            &[ID_LIGHTING_GET_VALUE, channel, value_id],
+            "(cmd, channel, value_id) echo mismatch on get_lighting",
+        )?;
         // Return the value bytes following the echoed channel + value_id.
         Ok(resp[3..].to_vec())
     }
@@ -373,12 +415,16 @@ impl CoalescerTransport for ViaTransport {
         value_id: u8,
         data: &[u8],
     ) -> Result<(), DriverError> {
+        if data.len() > MAX_LIGHTING_VALUE {
+            return Err(DriverError::ProtocolViolation {
+                reason: "lighting value exceeds 29-byte frame capacity",
+            });
+        }
         let mut req = [0u8; VIA_FRAME_LEN];
         req[0] = ID_LIGHTING_SET_VALUE; // id_custom_set_value (0x07)
         req[1] = channel;
         req[2] = value_id;
-        let max_len = std::cmp::min(data.len(), VIA_FRAME_LEN - 3);
-        req[3..3 + max_len].copy_from_slice(&data[..max_len]);
+        req[3..3 + data.len()].copy_from_slice(data);
         self.roundtrip(req, "set_lighting").await?;
         Ok(())
     }
@@ -716,12 +762,7 @@ impl KeyboardDriver for ViaDriver {
         match &mut self.inner {
             ViaInner::Direct(t) => t.get_layer_count().await,
             ViaInner::Coalesced { op_tx, .. } => {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                op_tx
-                    .send(CoalescerOp::GetLayerCount { reply: reply_tx })
-                    .await
-                    .map_err(|_| DriverError::Disconnected)?;
-                reply_rx.await.map_err(|_| DriverError::Disconnected)?
+                relay(op_tx, |reply| CoalescerOp::GetLayerCount { reply }).await
             }
         }
     }
@@ -730,12 +771,7 @@ impl KeyboardDriver for ViaDriver {
         match &mut self.inner {
             ViaInner::Direct(t) => t.get_keycode(layer, row, col).await,
             ViaInner::Coalesced { op_tx, .. } => {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                op_tx
-                    .send(CoalescerOp::GetKeycode { layer, row, col, reply: reply_tx })
-                    .await
-                    .map_err(|_| DriverError::Disconnected)?;
-                reply_rx.await.map_err(|_| DriverError::Disconnected)?
+                relay(op_tx, |reply| CoalescerOp::GetKeycode { layer, row, col, reply }).await
             }
         }
     }
@@ -750,12 +786,7 @@ impl KeyboardDriver for ViaDriver {
         match &mut self.inner {
             ViaInner::Direct(t) => t.set_keycode(layer, row, col, keycode).await,
             ViaInner::Coalesced { op_tx, .. } => {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                op_tx
-                    .send(CoalescerOp::SetKeycode { layer, row, col, keycode, reply: reply_tx })
-                    .await
-                    .map_err(|_| DriverError::Disconnected)?;
-                reply_rx.await.map_err(|_| DriverError::Disconnected)?
+                relay(op_tx, |reply| CoalescerOp::SetKeycode { layer, row, col, keycode, reply }).await
             }
         }
     }
@@ -764,12 +795,7 @@ impl KeyboardDriver for ViaDriver {
         match &mut self.inner {
             ViaInner::Direct(t) => t.get_macro_buffer(offset, length).await,
             ViaInner::Coalesced { op_tx, .. } => {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                op_tx
-                    .send(CoalescerOp::GetMacro { offset, length, reply: reply_tx })
-                    .await
-                    .map_err(|_| DriverError::Disconnected)?;
-                reply_rx.await.map_err(|_| DriverError::Disconnected)?
+                relay(op_tx, |reply| CoalescerOp::GetMacro { offset, length, reply }).await
             }
         }
     }
@@ -778,12 +804,8 @@ impl KeyboardDriver for ViaDriver {
         match &mut self.inner {
             ViaInner::Direct(t) => t.set_macro_buffer(offset, data).await,
             ViaInner::Coalesced { op_tx, .. } => {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                op_tx
-                    .send(CoalescerOp::SetMacro { offset, data: data.to_vec(), reply: reply_tx })
-                    .await
-                    .map_err(|_| DriverError::Disconnected)?;
-                reply_rx.await.map_err(|_| DriverError::Disconnected)?
+                let data = data.to_vec();
+                relay(op_tx, |reply| CoalescerOp::SetMacro { offset, data, reply }).await
             }
         }
     }
@@ -792,12 +814,7 @@ impl KeyboardDriver for ViaDriver {
         match &mut self.inner {
             ViaInner::Direct(t) => t.get_lighting(channel, value_id).await,
             ViaInner::Coalesced { op_tx, .. } => {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                op_tx
-                    .send(CoalescerOp::GetLighting { channel, value_id, reply: reply_tx })
-                    .await
-                    .map_err(|_| DriverError::Disconnected)?;
-                reply_rx.await.map_err(|_| DriverError::Disconnected)?
+                relay(op_tx, |reply| CoalescerOp::GetLighting { channel, value_id, reply }).await
             }
         }
     }
@@ -811,12 +828,8 @@ impl KeyboardDriver for ViaDriver {
         match &mut self.inner {
             ViaInner::Direct(t) => t.set_lighting(channel, value_id, data).await,
             ViaInner::Coalesced { op_tx, .. } => {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                op_tx
-                    .send(CoalescerOp::SetLighting { channel, value_id, data: data.to_vec(), reply: reply_tx })
-                    .await
-                    .map_err(|_| DriverError::Disconnected)?;
-                reply_rx.await.map_err(|_| DriverError::Disconnected)?
+                let data = data.to_vec();
+                relay(op_tx, |reply| CoalescerOp::SetLighting { channel, value_id, data, reply }).await
             }
         }
     }
@@ -828,12 +841,7 @@ impl KeyboardDriver for ViaDriver {
             ViaInner::Direct(_) => Ok(()),
             // Coalescing VIA: drain the buffer through the transport.
             ViaInner::Coalesced { op_tx, .. } => {
-                let (reply_tx, reply_rx) = oneshot::channel();
-                op_tx
-                    .send(CoalescerOp::Flush { reply: reply_tx })
-                    .await
-                    .map_err(|_| DriverError::Disconnected)?;
-                reply_rx.await.map_err(|_| DriverError::Disconnected)?
+                relay(op_tx, |reply| CoalescerOp::Flush { reply }).await
             }
         }
     }
@@ -917,8 +925,21 @@ fn probe_via_usage_page(fd: &OwnedFd) -> Result<(), DriverError> {
             .map_err(|e| DriverError::Io(io_from_errno(e)))?;
     }
 
+    if desc_size <= 0 {
+        return Err(DriverError::ProtocolViolation {
+            reason: "invalid or empty HID report descriptor size",
+        });
+    }
+
+    // Clamp the kernel-reported size to the buffer bound. The kernel caps
+    // HID descriptors at HID_MAX_DESCRIPTOR_SIZE, but a negative c_int
+    // (cast to a huge usize) or an out-of-spec value would otherwise panic
+    // the slice index below. `min` handles both the negative-cast and the
+    // oversize cases.
+    let size = (desc_size as usize).min(HID_MAX_DESCRIPTOR_SIZE);
+
     let mut rpt_desc = HidrawReportDescriptor {
-        size: desc_size as u32,
+        size: size as u32,
         value: [0u8; HID_MAX_DESCRIPTOR_SIZE],
     };
 
@@ -928,7 +949,7 @@ fn probe_via_usage_page(fd: &OwnedFd) -> Result<(), DriverError> {
             .map_err(|e| DriverError::Io(io_from_errno(e)))?;
     }
 
-    let desc_bytes = &rpt_desc.value[..rpt_desc.size as usize];
+    let desc_bytes = &rpt_desc.value[..(rpt_desc.size as usize).min(HID_MAX_DESCRIPTOR_SIZE)];
     if hid_descriptor_has_usage_page(desc_bytes, VIA_USAGE_PAGE) {
         Ok(())
     } else {
@@ -1047,6 +1068,31 @@ mod tests {
             0xA1, 0x01,       // Collection (Application)
             0xC0,             // End Collection
         ]
+    }
+
+    #[test]
+    fn validate_echo_accepts_matching_prefix() {
+        let mut resp = [0u8; VIA_FRAME_LEN];
+        resp[..4].copy_from_slice(&[ID_DYNAMIC_KEYMAP_GET_KEYCODE, 1, 2, 3]);
+        assert!(validate_echo(&resp, &[ID_DYNAMIC_KEYMAP_GET_KEYCODE, 1, 2, 3], "x").is_ok());
+    }
+
+    #[test]
+    fn validate_echo_rejects_mismatch() {
+        let mut resp = [0u8; VIA_FRAME_LEN];
+        resp[..4].copy_from_slice(&[ID_DYNAMIC_KEYMAP_GET_KEYCODE, 1, 2, 3]);
+        assert!(matches!(
+            validate_echo(&resp, &[ID_DYNAMIC_KEYMAP_GET_KEYCODE, 9, 2, 3], "x"),
+            Err(DriverError::ProtocolViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn frame_capacity_constants_match_protocol_layout() {
+        // macro frame: [cmd, off_hi, off_lo, size] + payload
+        assert_eq!(MAX_MACRO_CHUNK, VIA_FRAME_LEN - 4);
+        // lighting frame: [cmd, channel, value_id] + payload
+        assert_eq!(MAX_LIGHTING_VALUE, VIA_FRAME_LEN - 3);
     }
 
     #[test]
