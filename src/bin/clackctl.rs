@@ -47,6 +47,8 @@ trait Clackd {
     fn list_devices(&self) -> zbus::Result<Vec<String>>;
     /// `(rows, cols, layer_count)` for a device.
     fn get_device_info(&self, device_id: &str) -> zbus::Result<(u8, u8, u8)>;
+    /// `(vendor_id, product_id, product_name)` for a device.
+    fn get_device_identity(&self, device_id: &str) -> zbus::Result<(u16, u16, String)>;
     /// Read the keycode at `(layer, row, col)`.
     fn get_keycode(&self, device_id: &str, layer: u8, row: u8, col: u8) -> zbus::Result<u16>;
     /// Write a keycode to `(layer, row, col)`.
@@ -99,6 +101,11 @@ enum Command {
     List,
     /// Show a device's matrix dimensions and layer count.
     Info {
+        /// Device id (e.g. `hidraw0`) or numeric index from `list`.
+        device: String,
+    },
+    /// Show a device's USB identity (vendor id, product id, name).
+    Identity {
         /// Device id (e.g. `hidraw0`) or numeric index from `list`.
         device: String,
     },
@@ -197,6 +204,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::List => cmd_list(&proxy).await,
         Command::Info { device } => cmd_info(&proxy, &device).await,
+        Command::Identity { device } => cmd_identity(&proxy, &device).await,
         Command::Get { device, layer, row, col } => cmd_get(&proxy, &device, layer, row, col).await,
         Command::Set { device, layer, row, col, keycode } => {
             cmd_set(&proxy, &device, layer, row, col, &keycode).await
@@ -236,6 +244,16 @@ async fn cmd_info(proxy: &ClackdProxy<'_>, device: &str) -> Result<(), CliError>
     println!("device {id}:");
     println!("  matrix:  {rows} rows × {cols} cols");
     println!("  layers:  {layers}");
+    Ok(())
+}
+
+async fn cmd_identity(proxy: &ClackdProxy<'_>, device: &str) -> Result<(), CliError> {
+    let id = resolve_device(proxy, device).await?;
+    let (vid, pid, name) = proxy.get_device_identity(&id).await?;
+    println!("device {id}:");
+    println!("  vendor:   0x{vid:04x}");
+    println!("  product:  0x{pid:04x}");
+    println!("  name:     {}", if name.is_empty() { "(unknown)" } else { &name });
     Ok(())
 }
 

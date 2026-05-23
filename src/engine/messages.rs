@@ -182,6 +182,21 @@ pub(crate) enum EngineCommand {
         reply: oneshot::Sender<Result<(u8, u8, u8), DaemonError>>,
     },
 
+    /// Fetch the USB identity `(vendor_id, product_id, product_name)` of a device.
+    ///
+    /// **Context:** VID/PID are cached on the registry entry at attach time
+    /// (from the `DeviceConnected` event), so this is answered without a
+    /// hardware round-trip. It lets frontends match a device against an
+    /// external layout definition (e.g. a VIA/KLE definition keyed on
+    /// `vid:pid`). `product_name` is currently a best-effort string and may be
+    /// empty until a udev-sourced model name is plumbed through.
+    GetDeviceIdentity {
+        /// Stable engine-side identifier for the target device.
+        device_id: String,
+        /// Reply channel; `(vendor_id, product_id, product_name)` on success.
+        reply: oneshot::Sender<Result<(u16, u16, String), DaemonError>>,
+    },
+
     /// Force a commit / NVRAM flush for a device.
     ///
     /// **Context:** Routed to the device worker, which calls

@@ -548,6 +548,15 @@ async fn handle_command(
             };
             let _ = reply.send(result);
         }
+        EngineCommand::GetDeviceIdentity { device_id, reply } => {
+            let result = match registry.devices.get(&device_id) {
+                // product name is not yet captured at discovery; report empty
+                // and let the frontend fall back to its own labelling.
+                Some(handle) => Ok((handle.vendor_id, handle.product_id, String::new())),
+                None => Err(DaemonError::DeviceNotFound { device_id }),
+            };
+            let _ = reply.send(result);
+        }
         EngineCommand::CommitToNvram { device_id, reply } => {
             dispatch_commit(registry, device_id, reply);
         }
