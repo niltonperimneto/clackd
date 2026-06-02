@@ -75,14 +75,22 @@ attribute.
 
 Confirmed: each transfer is a **64-byte Feature report**, report ID `0x00`.
 On Linux the `HIDIOCSFEATURE` buffer is `[0x00, <64 payload bytes...>]` (byte 0 is the
-report ID). The Windows USBPcap capture's SET_REPORT data field is the 64 payload bytes.
+report ID). The Windows USBPcap capture exposes the 64 payload bytes in the
+**`usb.data_fragment`** field (not `usb.capdata`/`usbhid.data`, which are empty here).
+
+Observations so far:
+- **No checksum.** Across red/green/blue only the RGB bytes change; all other bytes
+  (including the `AA 55` footer) stay constant, so nothing is summing the payload.
+- **`AA 55` footer magic** appears at offset 14–15 of the `0x01` command.
+- The `0x04 xx` frames are high-frequency **status-poll heartbeats** from the app
+  (e.g. `04 02 …`, `04 F5 … 09 …`), not configuration writes — ignore them.
 
 ```
 Offset  Size  Field        Notes
 ------  ----  -----------  ---------------------------------
-0       1     command      command/header byte — see §3   (TODO: confirm offset)
-...     ...   payload      TODO
-TODO    TODO  checksum     algorithm: TODO
+0       1     command      command id — see §3
+1..     ...   payload      command-specific
+14..15  2     footer       AA 55 (seen on the 0x01 command; confirm per-command)
 ```
 
 **Checksum algorithm:** `TODO` (e.g. `sum(bytes[a..b]) & 0xFF` at offset `TODO`).
@@ -99,15 +107,19 @@ One row per discovered command. Capture **one variable per capture** and diff.
 
 | Command (hex) | Meaning | Confirmed? | Capture file | Notes |
 |---|---|---|---|---|
-| `TODO` | RGB: set mode | ☐ | | |
-| `TODO` | RGB: brightness | ☐ | | byte sweep 0/50/100 |
+| `0x01` | RGB: set global solid color (all keys) | ✅ | red/green/blue | R@1 G@2 B@3; byte9=`10`, byte10=`0b` const; footer `AA 55`@14 |
+| `0x01` byte 9? | RGB: brightness | ☐ | | hypothesis: byte 9 (=`0x10`); confirm via brightness sweep |
+| `0x01` byte 10? | RGB: effect/mode id | ☐ | | hypothesis: byte 10 (=`0x0b`=static); confirm via mode change |
 | `TODO` | RGB: speed | ☐ | | |
 | `TODO` | RGB: direction | ☐ | | |
-| `TODO` | RGB: global color (R/G/B layout) | ☐ | | pure R/G/B/white |
 | `TODO` | Per-key RGB | ☐ | | key-index encoding |
 | `TODO` | Key remap (set keycode at position) | ☐ | | matrix-index + keycode map |
 | `TODO` | Commit / persist to EEPROM | ☐ | | the "save" click |
 | `TODO` | Macro: define/slot | ☐ | | 2- vs 3-key macro diff |
+
+### Heartbeat / poll frames (ignore for config)
+`04 02 …`, `04 F5 … (byte8=09)`, `04 F0 …`, `04 18 …`, `04 13 … (byte8=01)` — sent
+continuously (~2/sec) while the app is open. Not configuration writes.
 
 ### 3.x Field detail templates (fill per command as confirmed)
 
@@ -149,6 +161,17 @@ One row per discovered command. Capture **one variable per capture** and diff.
 
 Record each capture here so the spec is reproducible.
 
-| # | Action performed (single variable) | File | Decoded delta |
+Extraction recipe (Windows PowerShell + tshark, dedup distinct frames):
+```
+& "C:\Program Files\Wireshark\tshark.exe" -r CAPTURE.pcapng `
+  -Y "usbhid.setup.bRequest == 0x09" -T fields -e usb.data_fragment |
+  Group-Object -NoElement | Sort-Object Count |
+  ForEach-Object { "{0,5}  {1}" -f $_.Count, $_.Name }
+```
+Low-count distinct lines = real commands; high-count lines = poll heartbeats.
+
+| # | Action performed (single variable) | Distinct frame (payload) | Decoded delta |
 |---|---|---|---|
-| 1 | `TODO` | | |
+| 1 | All keys solid **red** | `01 ff 00 00 …10 0b…aa 55` | R=byte1 |
+| 2 | All keys solid **green** | `01 00 ff 00 …10 0b…aa 55` | G=byte2 |
+| 3 | All keys solid **blue** | `01 00 00 ff …10 0b…aa 55` | B=byte3 |
