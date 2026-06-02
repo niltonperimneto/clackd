@@ -109,10 +109,33 @@ One row per discovered command. Capture **one variable per capture** and diff.
 |---|---|---|---|---|
 | `0x01` | RGB: set global **static** color (all keys) | ✅ | red/green/blue, bright | R@1 G@2 B@3; **byte9=brightness**; byte10=`0b` const; footer `AA 55`@14 |
 | `0x01` byte 9 | RGB: **brightness** | ✅ | bright | confirmed: byte 9 ranges `0x01`(min)–`0x10`(max), 16 levels |
-| byte 10 | constant `0x0b` (sub-field, **not** effect id) | ✅ | | unchanged across color/brightness/effect; purpose TBD |
-| `0x05` | RGB: **animated effect** select | ◐ | bright | seen once switching effect: `05 FF …00 01 10 0b…AA 55`; need multi-effect diff to locate effect# / speed / direction |
-| `TODO` | RGB: speed | ☐ | | likely a byte in the `0x05` frame |
-| `TODO` | RGB: direction | ☐ | | likely a byte in the `0x05` frame |
+| byte 0 | RGB: **effect/mode id** | ✅ | fx | **byte 0 IS the mode selector** — see §3.1 (20-mode table) |
+| byte 8 | RGB: rainbow/multicolor flag | ◐ | fx | `=01` on Colourful/Spectrum; else `00` |
+| `TODO` | RGB: speed | ☐ | | not yet isolated (byte 11? per-mode) |
+| `TODO` | RGB: direction | ☐ | | not yet isolated |
+| `TODO` | RGB: Random Color toggle | ☐ | | likely a single flag byte; capture on/off diff |
+
+### 3.1 Lighting frame & effect-mode table (confirmed)
+
+Lighting frame (64-byte payload):
+```
+byte 0    effect/mode ID (table below)
+byte 1-3  R, G, B (single-color modes)
+byte 8    rainbow/multicolor flag (01 on Colourful/Spectrum)
+byte 9    brightness 0x01..0x10
+byte 10   0x0B when lit, 0x01 when off
+byte 14-15 AA 55 footer
+```
+
+| Mode | ID | Mode | ID | Mode | ID | Mode | ID |
+|---|---|---|---|---|---|---|---|
+| LED off | `0x00` | Falling | `0x05` | Scrolling | `0x0A` | Ripples | `0x0F` |
+| Static | `0x01` | Colourful | `0x06` | Rolling | `0x0B` | Flowing | `0x10` |
+| SingleOn | `0x02` | Breath | `0x07` | Rotating | `0x0C` | Pulsating | `0x11` |
+| Single Off | `0x03` | Spectrum | `0x08` | Explor | `0x0D` | Tilt | `0x12` |
+| Glittering | `0x04`* | Outward | `0x09` | Launch | `0x0E` | Shuttle | `0x13` |
+
+*Glittering inferred (filter `data_fragment[0]!=04` dropped it; perfect sequential fit).
 | `TODO` | Per-key RGB | ☐ | | key-index encoding |
 | `TODO` | Key remap (set keycode at position) | ☐ | | matrix-index + keycode map |
 | `TODO` | Commit / persist to EEPROM | ☐ | | the "save" click |
@@ -178,3 +201,4 @@ Low-count distinct lines = real commands; high-count lines = poll heartbeats.
 | 3 | All keys solid **blue** | `01 00 00 ff …10 0b…aa 55` | B=byte3 |
 | 4 | Blue, brightness sweep | `01 00 00 ff …{0f,10,01} 0b…` | byte9=brightness (0x01–0x10) |
 | 5 | Switch to animated effect | `05 ff 00 …00 01 10 0b…aa 55` | cmd 0x05 = effect (partial) |
+| 6 | Step through all 20 modes (Random Color off, fixed color) | `02..13` + `00`, byte0 incrementing | byte0 = effect/mode id; full table §3.1 |
