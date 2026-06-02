@@ -107,11 +107,12 @@ One row per discovered command. Capture **one variable per capture** and diff.
 
 | Command (hex) | Meaning | Confirmed? | Capture file | Notes |
 |---|---|---|---|---|
-| `0x01` | RGB: set global solid color (all keys) | ✅ | red/green/blue | R@1 G@2 B@3; byte9=`10`, byte10=`0b` const; footer `AA 55`@14 |
-| `0x01` byte 9? | RGB: brightness | ☐ | | hypothesis: byte 9 (=`0x10`); confirm via brightness sweep |
-| `0x01` byte 10? | RGB: effect/mode id | ☐ | | hypothesis: byte 10 (=`0x0b`=static); confirm via mode change |
-| `TODO` | RGB: speed | ☐ | | |
-| `TODO` | RGB: direction | ☐ | | |
+| `0x01` | RGB: set global **static** color (all keys) | ✅ | red/green/blue, bright | R@1 G@2 B@3; **byte9=brightness**; byte10=`0b` const; footer `AA 55`@14 |
+| `0x01` byte 9 | RGB: **brightness** | ✅ | bright | confirmed: byte 9 ranges `0x01`(min)–`0x10`(max), 16 levels |
+| byte 10 | constant `0x0b` (sub-field, **not** effect id) | ✅ | | unchanged across color/brightness/effect; purpose TBD |
+| `0x05` | RGB: **animated effect** select | ◐ | bright | seen once switching effect: `05 FF …00 01 10 0b…AA 55`; need multi-effect diff to locate effect# / speed / direction |
+| `TODO` | RGB: speed | ☐ | | likely a byte in the `0x05` frame |
+| `TODO` | RGB: direction | ☐ | | likely a byte in the `0x05` frame |
 | `TODO` | Per-key RGB | ☐ | | key-index encoding |
 | `TODO` | Key remap (set keycode at position) | ☐ | | matrix-index + keycode map |
 | `TODO` | Commit / persist to EEPROM | ☐ | | the "save" click |
@@ -175,3 +176,5 @@ Low-count distinct lines = real commands; high-count lines = poll heartbeats.
 | 1 | All keys solid **red** | `01 ff 00 00 …10 0b…aa 55` | R=byte1 |
 | 2 | All keys solid **green** | `01 00 ff 00 …10 0b…aa 55` | G=byte2 |
 | 3 | All keys solid **blue** | `01 00 00 ff …10 0b…aa 55` | B=byte3 |
+| 4 | Blue, brightness sweep | `01 00 00 ff …{0f,10,01} 0b…` | byte9=brightness (0x01–0x10) |
+| 5 | Switch to animated effect | `05 ff 00 …00 01 10 0b…aa 55` | cmd 0x05 = effect (partial) |
