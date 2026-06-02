@@ -33,31 +33,55 @@ Fill from USB Device Tree Viewer / Device Manager on Windows, cross-check with
 
 | Field | Value |
 |---|---|
-| USB Vendor ID (VID) | `TODO` |
-| USB Product ID (PID) | `TODO` |
-| Manufacturer string | `TODO` |
-| Number of HID interfaces | `TODO` |
-| **Vendor/config interface** number | `TODO` |
-| Vendor interface **Usage Page** | `TODO` (hypothesis: `0xFF00`) |
-| Vendor interface Usage | `TODO` |
-| Report ID (if any) | `TODO` |
-| Report length (bytes) | `TODO` (hypothesis: 64) |
-| Transport (SET_REPORT control / interrupt OUT) | `TODO` |
-| OUT endpoint address | `TODO` |
-| IN endpoint address (replies, if any) | `TODO` |
+| USB Vendor ID (VID) | **`0x05AC`** (reports as "Apple" — spoofed; real maker `hfd.cn`) |
+| USB Product ID (PID) | **`0x024F`** |
+| Manufacturer / Product strings | `"hfd.cn"` / `"EK68"` |
+| bcdDevice | `0x0104` |
+| Number of HID interfaces | **2** (composite, `usbccgp`) |
+| **Vendor/config interface** number | **Interface 0** |
+| Config report type | **FEATURE report** (`B1 02`, Report Count 64 / Size 8) |
+| Config report length | **64 bytes** |
+| Report ID | **`0x00`** (none declared for the feature report) |
+| Transport | **SET_REPORT(Feature) / GET_REPORT(Feature) control transfers** |
+| OUT endpoint | **none** — both endpoints (`0x81`, `0x82`) are interrupt **IN** |
 
-Linux `/dev/hidrawN` selection note (which collection to bind): `TODO`
+**Interface map**
+- **Interface 0** — boot keyboard (`bInterfaceProtocol=01`), IN ep `0x81`. Report
+  descriptor also declares the **64-byte vendor Feature report** (under the
+  Generic-Desktop/Keyboard application collection). **This is the config channel.**
+- **Interface 1** — consumer control (RID 3), system control (RID 2), NKRO keyboard
+  (RID 1, 120 keys), mouse (RID 6), and a vendor-defined input collection (RID 5,
+  usage page `0xFFFF`). IN ep `0x82`. Used for *reporting* events, not config.
+
+**Linux `/dev/hidrawN` selection:** bind the hidraw node for **Interface 0** (the one
+exposing the 64-byte Feature report). There is no unique vendor *usage page* to probe
+(the feature report sits inside the keyboard collection), so selection is by
+**VID/PID `05ac:024f` + interface 0** (or by "has a 64-byte feature report"). The
+Interface-0 hidraw node is identifiable via its udev `HID_NAME`/interface-number
+attribute.
+
+> **Transport implication for `src/hal/epomaker.rs`:** because the channel is a
+> *Feature* report with **no OUT endpoint**, the driver must use the
+> **`HIDIOCSFEATURE(len)` / `HIDIOCGFEATURE(len)`** ioctls (via `nix`) on the
+> Interface-0 hidraw fd — NOT the `read()`/`write()` + `AsyncFd` model that `via.rs`
+> uses for its interrupt pipe. These ioctls are synchronous control transfers; wrap
+> them in `tokio::task::spawn_blocking` (or a dedicated blocking thread) to keep the
+> Tokio runtime unblocked. Reuse `via.rs`'s ioctl-wrapping style
+> (`nix::ioctl_*` macros) as the pattern, not its transfer mechanism.
 
 ---
 
 ## 2. Frame format  (Phase A4)
 
+Confirmed: each transfer is a **64-byte Feature report**, report ID `0x00`.
+On Linux the `HIDIOCSFEATURE` buffer is `[0x00, <64 payload bytes...>]` (byte 0 is the
+report ID). The Windows USBPcap capture's SET_REPORT data field is the 64 payload bytes.
+
 ```
 Offset  Size  Field        Notes
 ------  ----  -----------  ---------------------------------
-TODO    TODO  report_id    TODO
-TODO    TODO  command      command/header byte — see §3
-TODO    TODO  ...          payload
+0       1     command      command/header byte — see §3   (TODO: confirm offset)
+...     ...   payload      TODO
 TODO    TODO  checksum     algorithm: TODO
 ```
 
