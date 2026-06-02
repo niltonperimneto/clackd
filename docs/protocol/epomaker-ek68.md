@@ -137,13 +137,39 @@ byte 14-15 AA 55 footer
 
 *Glittering inferred (filter `data_fragment[0]!=04` dropped it; perfect sequential fit).
 | `TODO` | Per-key RGB | ☐ | | key-index encoding |
-| `TODO` | Key remap (set keycode at position) | ☐ | | matrix-index + keycode map |
-| `TODO` | Commit / persist to EEPROM | ☐ | | the "save" click |
+| `0x00` frame | Key remap / keymap write | ✅ | remap, remap2, pos | see §3.2; 4-byte slots, VIA keycodes |
+| persist | **automatic** — written live to EEPROM on every change | ✅ | | **no save command**; app writes immediately (EEPROM-wear risk → clackd must coalesce) |
 | `TODO` | Macro: define/slot | ☐ | | 2- vs 3-key macro diff |
 
 ### Heartbeat / poll frames (ignore for config)
 `04 02 …`, `04 F5 … (byte8=09)`, `04 F0 …`, `04 18 …`, `04 13 … (byte8=01)` — sent
 continuously (~2/sec) while the app is open. Not configuration writes.
+
+### 3.2 Keymap / remap frame (confirmed structure)
+
+Frame type: **byte 0 = `0x00`**. The 64-byte payload is a sparse keymap-edit page.
+Each remapped key is a **4-byte slot** at **offset = `slot_index * 4`**:
+
+```
+slot offset+0 : 0x02         "set this key" marker
+slot offset+1 : 0x00
+slot offset+2 : keycode low   } 16-bit little-endian VIA/QMK keycode
+slot offset+3 : keycode high  }   (e.g. KC_A = 0x0004 -> 04 00)
+```
+Unwritten slots are zero (left unchanged). A separate all-zero frame ending in
+`AA 55` (bytes 62–63) terminates the transaction.
+
+Confirmed keycodes are **standard VIA/QMK**: A=`0x0004`, B=`0x0005`, C=`0x0006`.
+
+**Observed slot indices** (key → slot): Esc→1, `1`→4, Tab→5, Q→6, Space→14.
+Slot order is matrix-scan order, **not** visual order (Esc=1, `1`=4 are not adjacent).
+
+**Open:**
+- **Paging** for slots ≥ 16 (offset ≥ 64) — all five probe keys were in page 0;
+  need a high-index key (e.g. arrows / right side) to find the page/offset header.
+- **Full slot→physical-key map** — data-collection task (remap each key, or derive
+  from the EK68 *VIA* variant's published layout JSON, likely same matrix).
+- Marker `0x02` / byte 1 `0x00`: possibly a layer indicator (only layer 0 tested).
 
 ### 3.x Field detail templates (fill per command as confirmed)
 
@@ -202,3 +228,5 @@ Low-count distinct lines = real commands; high-count lines = poll heartbeats.
 | 4 | Blue, brightness sweep | `01 00 00 ff …{0f,10,01} 0b…` | byte9=brightness (0x01–0x10) |
 | 5 | Switch to animated effect | `05 ff 00 …00 01 10 0b…aa 55` | cmd 0x05 = effect (partial) |
 | 6 | Step through all 20 modes (Random Color off, fixed color) | `02..13` + `00`, byte0 incrementing | byte0 = effect/mode id; full table §3.1 |
+| 7 | CapsLock → A/B/C | `…02 00 0{4,5,6} 00` @off 30 | keycode = VIA (A=04,B=05,C=06) |
+| 8 | Esc/1/Tab/Q/Space → A | `02 00 04 00` @off 4/16/20/24/56 | slot offset = key_index×4; §3.2 |
