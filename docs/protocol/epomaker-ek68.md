@@ -172,15 +172,25 @@ Slot order is matrix-scan order, **not** visual order (Esc=1, `1`=4 are not adja
 
 A bulk sweep must do BOTH steps per key (click key → pick target) or only selects are sent.
 
-**Confirmed slot map (writes, key → slot):**
-Esc=1, `1`=4, `5`=8, Tab=5, Q=6, Space=14. (Slots are electrical scan order, not visual.)
+**offset = slot × 4 — PROVEN.** A shuffled-order capture (clicked `5`,`Esc`,`=`,`1`)
+placed each key at its *own* fixed offset (32,4,60,16 = slots 8,1,15,4) regardless of
+click order — so the position is the physical slot, not edit order. The write buffer is
+the **cumulative keymap**: each edited key occupies its 4-byte slot; the app re-sends the
+sparse set of this-session edits each time.
+
+**Confirmed slot map (key → slot):**
+- `Esc`=1
+- number row `1 2 3 4 5 6 7 8 9 0 - =` = slots `4 5 6 7 8 9 10 11 12 13 14 15`
+  (anchored by `1`=4, `5`=8, `=`=15 from clean post-reset captures).
+- Slots 0, 2, 3 belong to other (non-number-row) keys — scan order is board-specific.
 
 **Open:**
-- **Paging** for slots ≥ 16 (offset ≥ 64) — all probe keys so far were in page 0;
-  need a high-index key (e.g. arrows / right side) to find the page/offset header.
-- **Full slot→physical-key map** — in progress via two-step remap sweep (each key → F9,
-  read the write-frame offset ÷ 4).
+- **Paging** for slots ≥ 16 (offset ≥ 64): page 0 holds slots 0–15; need a higher-index
+  key (rows 2–5, right column, arrows) to learn how additional pages are addressed.
+- **Remaining slot→key map** (rows 2–5 + nav/arrows) — continue the post-reset sweep.
 - Marker `0x02` / byte 1 `0x00`: possibly a layer indicator (only layer 0 tested).
+
+**Reset:** the app has a restore-to-default that clears all remaps (used between sweeps).
 
 ### 3.x Field detail templates (fill per command as confirmed)
 
