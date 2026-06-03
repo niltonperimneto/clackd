@@ -207,6 +207,23 @@ delivers the new keycode. The buffer **wraps/pages** after filling. Net effect:
 - Exact page/wrap signaling for the buffer.
 - Marker `0x02` / byte 1 `0x00`: possibly a layer indicator (only layer 0 tested).
 
+### 3.3 Passive-sniffing ceiling reached (remap addressing)
+
+A fully-unfiltered single remap (`E → F9`, post-reset) produced **only** the write
+`02 00 42 @ offset 32` plus generic heartbeats (`04 18`, `04 11…09`, `04 02`, `04 f0`).
+The byte-identical write is what `5 → F9` produces too. **There is no key/row/scancode
+disambiguator anywhere in the SET_REPORT stream**, so two different physical keys at the
+same column offset cannot be told apart from captures alone. The keyboard must rely on
+selection state set through another channel (GET_REPORT polling and/or internal state from
+the on-screen click).
+
+**Consequence:** a passive remap "slot sweep" cannot yield unique per-key addresses, so it
+is abandoned. The remap addressing is to be finalized by **active testing against the real
+device** during driver development — e.g. send `select(02 00 <scancode> @20)` then
+`write(02 00 <kc> @offset)` and observe which physical key changes; iterate to confirm
+whether the select frame, the offset, or both are load-bearing. Lighting is fully decoded
+and unaffected.
+
 **Reset:** the app has a restore-to-default that clears all remaps (used between sweeps).
 
 ### 3.x Field detail templates (fill per command as confirmed)
