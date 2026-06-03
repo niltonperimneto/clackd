@@ -62,6 +62,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use thiserror::Error;
 
+pub mod epomaker;
 pub mod via;
 
 /// Errors raised by [`KeyboardDriver`] implementations.

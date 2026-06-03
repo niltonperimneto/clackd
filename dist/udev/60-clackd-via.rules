@@ -36,6 +36,9 @@
 #   # Keychron K2 V2 — vid 3434 pid 0151
 #   #SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3434", ATTRS{idProduct}=="0151", TAG+="uaccess"
 #
+#   # Epomaker EK68 (non-VIA, driver=epomaker) — vid 05ac pid 024f
+#   #SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="024f", TAG+="uaccess"
+#
 #   # Generic placeholder
 #   #SUBSYSTEM=="hidraw", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", TAG+="uaccess"
 #

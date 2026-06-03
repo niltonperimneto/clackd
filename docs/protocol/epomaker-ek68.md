@@ -1,5 +1,10 @@
 # Epomaker EK68 (non-VIA) — proprietary HID protocol
 
+> **Driver:** implemented in `src/hal/epomaker.rs` (registered via
+> `driver = "epomaker"` in `devices.toml`). Lighting is fully wired; keymap is
+> shadow-state + select/write commit pending hardware confirmation of the
+> write offset; macros are shadow-only (format not yet decoded).
+>
 > **Status: IN PROGRESS — reverse engineering.**
 > This is a living document. Fields marked `TODO` are unconfirmed and must be
 > filled from Wireshark/USBPcap captures (wired USB) of the official Epomaker

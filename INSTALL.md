@@ -111,6 +111,29 @@ cols = 15
 # layer_count_override = 4  # optional; overrides firmware report
 ```
 
+### Non-VIA vendor drivers (Epomaker EK68)
+
+Devices that don't speak VIA use a vendor backend, selected with `driver`.
+The Epomaker EK68 (non-VIA model, USB `05ac:024f`) is driven over its 64-byte
+HID Feature report:
+
+```toml
+[[device]]
+vid = 0x05ac
+pid = 0x024f
+rows = 5
+cols = 15
+driver = "epomaker"
+```
+
+`driver` defaults to `"via"` when omitted. RGB lighting (mode/colour/brightness)
+is fully supported; key remapping is shadow-state with a vendor-blob commit (see
+`docs/protocol/epomaker-ek68.md`). The matching udev line:
+
+```
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="024f", TAG+="uaccess"
+```
+
 ### Write-coalescing buffer
 
 Off by default per the VIA-first invariant. To enable, set
