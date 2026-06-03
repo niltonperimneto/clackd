@@ -164,11 +164,22 @@ Confirmed keycodes are **standard VIA/QMK**: A=`0x0004`, B=`0x0005`, C=`0x0006`.
 **Observed slot indices** (key → slot): Esc→1, `1`→4, Tab→5, Q→6, Space→14.
 Slot order is matrix-scan order, **not** visual order (Esc=1, `1`=4 are not adjacent).
 
+**Remap UI choreography (confirmed):** a remap is two steps / two frames:
+1. **Select** (click key on layout): `02 00 <source key default scancode>` at **offset 4**
+   (a fixed select/scratch register — *not* the key's slot). Informational; ignore for writes.
+2. **Write** (pick target keycode): `02 00 <new keycode>` at **offset = slot × 4**.
+   This is the real keymap write. Only fires when the target is actually chosen.
+
+A bulk sweep must do BOTH steps per key (click key → pick target) or only selects are sent.
+
+**Confirmed slot map (writes, key → slot):**
+Esc=1, `1`=4, `5`=8, Tab=5, Q=6, Space=14. (Slots are electrical scan order, not visual.)
+
 **Open:**
-- **Paging** for slots ≥ 16 (offset ≥ 64) — all five probe keys were in page 0;
+- **Paging** for slots ≥ 16 (offset ≥ 64) — all probe keys so far were in page 0;
   need a high-index key (e.g. arrows / right side) to find the page/offset header.
-- **Full slot→physical-key map** — data-collection task (remap each key, or derive
-  from the EK68 *VIA* variant's published layout JSON, likely same matrix).
+- **Full slot→physical-key map** — in progress via two-step remap sweep (each key → F9,
+  read the write-frame offset ÷ 4).
 - Marker `0x02` / byte 1 `0x00`: possibly a layer indicator (only layer 0 tested).
 
 ### 3.x Field detail templates (fill per command as confirmed)
