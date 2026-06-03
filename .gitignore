@@ -1,3 +1,7 @@
 CLAUDE.md
 .claude/
 target/
+
+# Python bytecode (from tools/*.py helpers)
+__pycache__/
+*.pyc
