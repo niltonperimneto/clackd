@@ -184,10 +184,27 @@ sparse set of this-session edits each time.
   (anchored by `1`=4, `5`=8, `=`=15 from clean post-reset captures).
 - Slots 0, 2, 3 belong to other (non-number-row) keys — scan order is board-specific.
 
-**Open:**
-- **Paging** for slots ≥ 16 (offset ≥ 64): page 0 holds slots 0–15; need a higher-index
-  key (rows 2–5, right column, arrows) to learn how additional pages are addressed.
-- **Remaining slot→key map** (rows 2–5 + nav/arrows) — continue the post-reset sweep.
+**Row 2 sweep (reset) — offsets COLLIDE with row 1:**
+Tab..P → offset/4 = 5..15; then `[ ] \` **wrap back to offset 0** (a new page).
+But `E`→offset 8 and (row1) `5`→offset 8 are the **same offset** for different keys.
+
+**⇒ Revised model (important):** the write **offset is NOT a global absolute slot** — it is
+a position within the **currently-selected row/page**. The keyboard identifies *which* key
+from the **select frame** (`02 00 <source default scancode>`), and the write frame just
+delivers the new keycode. The buffer **wraps/pages** after filling. Net effect:
+
+- A remap is **select(source scancode) → write(new keycode)**.
+- **Source keys are addressed by their standard default scancode** (Esc=0x29, 1=0x1e,
+  Tab=0x2b, Q=0x14, …) — which is the factory US-HID layout and needs **no capture**.
+- A hand-built physical slot map is therefore likely **unnecessary** for the driver; the
+  exact write-offset/paging only needs to be replicated well enough to satisfy the
+  firmware, which is best nailed down by **testing against the real device** during
+  driver development.
+
+**Open (resolve during implementation, on hardware):**
+- Whether the firmware requires the write at the app's exact offset, or accepts a fixed
+  offset given a preceding select. Test: send select(scancode)+write(kc) and observe.
+- Exact page/wrap signaling for the buffer.
 - Marker `0x02` / byte 1 `0x00`: possibly a layer indicator (only layer 0 tested).
 
 **Reset:** the app has a restore-to-default that clears all remaps (used between sweeps).
