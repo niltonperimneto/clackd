@@ -256,6 +256,36 @@ and unaffected.
 
 ---
 
+## 3.4 Hardware bring-up findings (wired EK68, Arch Linux, via clackd)
+
+End-to-end run against the physical keyboard (USB cable; config interface = the
+hidraw node with the 64-byte Feature report):
+
+- ✅ Daemon attaches the **epomaker** driver to interface 0; interface 1 correctly
+  rejected (no Feature report). `clackctl list` shows the device.
+- ✅ `clackctl set-lighting` → D-Bus → engine → `HIDIOCSFEATURE` **all succeed**.
+- ✅ The keyboard **accepts and stores** our 64-byte lighting frames:
+  `HIDIOCGFEATURE` reads back the exact bytes we wrote (e.g. white → `01 ff ff ff …`).
+- ❌ **No visible rendering.** Static color, brightness, and effect frames are stored
+  but the LEDs don't change (a faint brightness blink was only seen while spamming the
+  guessed `04 xx` poll frames).
+- **Not a checksum:** the brightness capture changed byte 9 alone with no co-varying
+  byte, so there is no payload checksum gating the render.
+- **Readback anomaly:** `HIDIOCGFEATURE` byte 3 (B) reads back `0xff` regardless of the
+  blue value written — investigate alongside the handshake.
+
+**Working hypothesis / next step:** the Windows app issues a one-time **"enter
+PC/software-lighting mode" handshake at connect** that we never captured (all prior
+captures were config *changes*, never the first ~1–2 s after the app connects). Needed
+capture (Windows, wired): start the tshark dump, *then* open the Epomaker app (or replug
+with it open), and record the first SET_REPORTs — diff against the known heartbeats to
+find the activation frame. Also capture two **custom** colors with different byte sums
+(e.g. `255,128,0` vs `0,128,255`) to double-check no checksum. Once the activation frame
+is known, the driver sends it on attach (and likely a periodic `04 xx` keepalive to hold
+software mode).
+
+---
+
 ## 4. Matrix / topology  (for clackd `get_matrix_dimensions` / `get_layer_count`)
 
 | Field | Value |
