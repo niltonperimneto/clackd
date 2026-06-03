@@ -120,6 +120,27 @@ One row per discovered command. Capture **one variable per capture** and diff.
 | `TODO` | RGB: direction | ☐ | | not yet isolated |
 | `TODO` | RGB: Random Color toggle | ☐ | | likely a single flag byte; capture on/off diff |
 
+### 3.0 Enter-PC-lighting-mode handshake (confirmed on hardware)
+
+The board **stores** host lighting frames (they read back via `GET_REPORT`) but
+keeps **rendering its onboard effect** until the app's one-time connect sequence
+runs. Captured host→device (`SET_REPORT`) in the first second after the Windows
+app connects, the distinct non-color frames (in order) are:
+
+| # | Frame (non-zero bytes) | Note |
+|---|---|---|
+| 1 | `00=04 01=18` | heartbeat |
+| 2 | `00=04 01=13 08=01` | heartbeat |
+| 3 | `09=01 0a=01 0e=AA 0f=55` | INIT_A — an onboard LED-off lighting frame |
+| 4 | `00=04 01=02` | heartbeat |
+| 5 | `00=04 01=f0` | heartbeat |
+| 6 | `00=04 01=17 02=01 08=01` | heartbeat |
+| 7 | `05=01 08=02 3e=AA 3f=55` | **INIT_B — enter PC-control (the activation)** |
+
+`INIT_B` (footer at byte 62, unlike the lighting footer at byte 14) is the
+load-bearing frame. The driver replays this whole sequence once per attach
+before the first lighting write (`pc_mode_handshake()` in `src/hal/epomaker.rs`).
+
 ### 3.1 Lighting frame & effect-mode table (confirmed)
 
 Lighting frame (64-byte payload):

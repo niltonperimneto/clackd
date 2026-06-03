@@ -299,6 +299,36 @@ fn encode_remap_write(keycode: u16) -> [u8; FRAME_LEN] {
     f
 }
 
+/// The frame sequence the Windows app emits on connect, *before* any lighting
+/// command.
+///
+/// **Why this exists (confirmed on hardware):** the board accepts and stores
+/// our lighting frames (they read back via `GET_REPORT`) but keeps *rendering*
+/// its onboard effect until this "enter PC / software-lighting mode" sequence
+/// runs. Captured host→device (`SET_REPORT`) traffic in the first second after
+/// the app connects; the load-bearing activation is the final frame
+/// (`byte5=0x01, byte8=0x02`, footer at 62), which is structurally unlike any
+/// lighting or heartbeat frame. The preceding frames replicate the app's
+/// connect preamble for fidelity. Sent exactly once per attach.
+fn pc_mode_handshake() -> [[u8; FRAME_LEN]; 7] {
+    let f = |pairs: &[(usize, u8)]| -> [u8; FRAME_LEN] {
+        let mut x = [0u8; FRAME_LEN];
+        for &(i, v) in pairs {
+            x[i] = v;
+        }
+        x
+    };
+    [
+        f(&[(0, 0x04), (1, 0x18)]),
+        f(&[(0, 0x04), (1, 0x13), (8, 0x01)]),
+        f(&[(9, 0x01), (10, 0x01), (14, 0xAA), (15, 0x55)]), // INIT_A (onboard LED-off frame)
+        f(&[(0, 0x04), (1, 0x02)]),
+        f(&[(0, 0x04), (1, 0xF0)]),
+        f(&[(0, 0x04), (1, 0x17), (2, 0x01), (8, 0x01)]),
+        f(&[(5, 0x01), (8, 0x02), (62, 0xAA), (63, 0x55)]), // INIT_B (enter PC-control)
+    ]
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Driver
 // ─────────────────────────────────────────────────────────────────────────────
@@ -317,6 +347,8 @@ pub struct EpomakerDriver {
     /// Positions changed since the last commit.
     dirty: BTreeMap<(u8, u8, u8), u16>,
     lighting: Lighting,
+    /// Whether the enter-PC-lighting-mode handshake has run this session.
+    pc_mode: bool,
 }
 
 impl EpomakerDriver {
@@ -357,7 +389,22 @@ impl EpomakerDriver {
             keymap: BTreeMap::new(),
             dirty: BTreeMap::new(),
             lighting: Lighting::default(),
+            pc_mode: false,
         }
+    }
+
+    /// Sends the enter-PC-lighting-mode handshake once, on first use. Without
+    /// it the board ignores host lighting and shows its onboard effect.
+    async fn ensure_pc_mode(&mut self) -> Result<(), DriverError> {
+        if self.pc_mode {
+            return Ok(());
+        }
+        debug!(device_id = %self.device_id, "sending EK68 enter-PC-lighting-mode handshake");
+        for frame in pc_mode_handshake() {
+            self.io.set_feature(frame).await?;
+        }
+        self.pc_mode = true;
+        Ok(())
     }
 
     /// Maps a matrix position to the source key's factory scancode used by
@@ -410,6 +457,7 @@ impl KeyboardDriver for EpomakerDriver {
         if lighting.mode > MODE_MAX {
             return Err(DriverError::ProtocolViolation { reason: "EK68 lighting mode out of range (0x00..=0x13)" });
         }
+        self.ensure_pc_mode().await?;
         self.io.set_feature(lighting.encode()).await?;
         self.lighting = lighting;
         debug!(device_id = %self.device_id, mode = lighting.mode, "set EK68 lighting");
@@ -645,6 +693,7 @@ mod tests {
     async fn set_lighting_sends_one_frame() {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
+        d.pc_mode = true; // skip the handshake to isolate the lighting frame
         d.set_lighting(0, &[MODE_STATIC, 0x00, 0xFF, 0x00, 0x08, 0]).await.unwrap();
         let sent = io.sent();
         assert_eq!(sent.len(), 1);
@@ -652,6 +701,24 @@ mod tests {
         assert_eq!(sent[0][LIGHT_OFF_BRIGHTNESS], 0x08);
         // get_lighting reflects last set
         assert_eq!(d.get_lighting(0).await.unwrap()[2], 0xFF);
+    }
+
+    #[tokio::test]
+    async fn handshake_runs_once_before_first_lighting() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        d.set_lighting(0, &[MODE_STATIC, 0xFF, 0, 0, 0x10, 0]).await.unwrap();
+        let n = pc_mode_handshake().len();
+        let sent = io.sent();
+        assert_eq!(sent.len(), n + 1, "handshake frames then the lighting frame");
+        // INIT_B (the enter-PC-control activation) is present in the handshake.
+        assert!(sent[..n].iter().any(|f| f[5] == 0x01 && f[8] == 0x02 && f[62] == 0xAA && f[63] == 0x55));
+        // The lighting frame comes last.
+        assert_eq!(sent[n][LIGHT_OFF_MODE], MODE_STATIC);
+        assert_eq!(sent[n][LIGHT_OFF_R], 0xFF);
+        // A second lighting call does NOT replay the handshake.
+        d.set_lighting(0, &[MODE_STATIC, 0, 0xFF, 0, 0x10, 0]).await.unwrap();
+        assert_eq!(io.sent().len(), n + 2);
     }
 
     #[tokio::test]

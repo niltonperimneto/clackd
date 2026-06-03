@@ -45,6 +45,25 @@ def lighting(mode, r, g, b, brightness=0x10, rainbow=False):
     f[14], f[15] = 0xAA, 0x55
     return f
 
+def pc_mode_handshake():
+    # The app's connect sequence; without it the board ignores host lighting
+    # and renders its onboard effect. INIT_B (f[5]=01, f[8]=02, footer @62) is
+    # the load-bearing "enter PC-control" activation. Mirrors src/hal/epomaker.rs.
+    def f(pairs):
+        x = bytearray(FRAME_LEN)
+        for i, v in pairs:
+            x[i] = v
+        return x
+    return [
+        f([(0, 0x04), (1, 0x18)]),
+        f([(0, 0x04), (1, 0x13), (8, 0x01)]),
+        f([(9, 0x01), (10, 0x01), (14, 0xAA), (15, 0x55)]),   # INIT_A
+        f([(0, 0x04), (1, 0x02)]),
+        f([(0, 0x04), (1, 0xF0)]),
+        f([(0, 0x04), (1, 0x17), (2, 0x01), (8, 0x01)]),
+        f([(5, 0x01), (8, 0x02), (62, 0xAA), (63, 0x55)]),    # INIT_B (activation)
+    ]
+
 def select_frame(scancode):
     f = bytearray(FRAME_LEN)
     f[20] = 0x02
@@ -88,6 +107,10 @@ def list_interfaces():
 
 def lighting_demo(h):
     print("\nLIGHTING DEMO (volatile -- does not touch EEPROM). Watch the keyboard.\n")
+    print("  -> enter-PC-lighting-mode handshake")
+    for fr in pc_mode_handshake():
+        h.send_feature_report(bytes([0x00]) + bytes(fr))
+        time.sleep(0.05)
     steps = [
         ("all RED, full bright",   lighting(MODES["static"], 0xFF, 0x00, 0x00)),
         ("all GREEN",              lighting(MODES["static"], 0x00, 0xFF, 0x00)),
