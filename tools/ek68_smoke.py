@@ -199,6 +199,24 @@ def lighting_demo(h):
     print("\nIf the colors/effects matched the labels, the lighting protocol is confirmed. ✅")
 
 
+def key_demo(h, idx, seconds=6.0):
+    print(f"\nKEY-MAP TEST -- lighting ONLY light_index {idx} green for "
+          f"{seconds:.0f}s. WHICH physical key lights up?\n")
+    colors = [(0x00, 0x00, 0x00)] * 128
+    if 0 <= idx < 128:
+        colors[idx] = (0x00, 0xFF, 0x00)
+    else:
+        sys.exit(f"light_index {idx} out of range (0..127)")
+    t0 = time.time()
+    n = 0
+    while time.time() - t0 < seconds:
+        send_direct(h, colors)
+        n += 1
+        time.sleep(1.0)  # keepalive <= 2s
+    print(f"  -> {n} refreshes. The key that lit has light_index = {idx} "
+          "(cross-check docs/protocol/epomaker-ek68.md §3.7).")
+
+
 def direct_demo(h, seconds=6.0):
     print("\nDIRECT (per-key) DEMO -- volatile, refreshed every 1s for "
           f"{seconds:.0f}s. Watch the keyboard.\n")
@@ -248,6 +266,8 @@ def main():
     ap = argparse.ArgumentParser(description="Epomaker EK68 protocol smoke test")
     ap.add_argument("--list", action="store_true", help="list EK68 HID interfaces and exit")
     ap.add_argument("--direct", action="store_true", help="run the per-key Direct mode demo")
+    ap.add_argument("--key", type=int, metavar="N",
+                    help="light ONLY light_index N green (verify the §3.7 key map)")
     ap.add_argument("--remap", action="store_true", help="run the remap experiment (writes EEPROM)")
     args = ap.parse_args()
 
@@ -257,7 +277,9 @@ def main():
 
     h = open_ek68()
     try:
-        if args.direct:
+        if args.key is not None:
+            key_demo(h, args.key)
+        elif args.direct:
             direct_demo(h)
         else:
             lighting_demo(h)

@@ -543,6 +543,59 @@ Direct/Custom mode.
 
 ---
 
+## 3.7 Key & LED index map (from the vendor `KeyboardLayout.xml`)
+
+The official Epomaker driver ships a `KeyboardLayout.xml` mapping every key to:
+its HID **`code`** (standard USB usage), a **`key_index`** (the keymap/remap
+slot — key-definition write, cmd `0x11`), and a **`light_index`** (the per-key
+LED framebuffer slot for `SendDirect`/`SendCustom`).
+
+**Key findings:**
+- **`key_index == light_index` for every key** in this layout — the remap slot
+  and the LED slot are the same number.
+- 66 keys; indices are **sparse (1–121)**, *not* 0-based contiguous → they are
+  the firmware's flat scan/buffer positions. This is exactly the addressing the
+  passive captures (§3.2/3.3) could not resolve. It **confirms Esc = index 1**
+  (matching the remap capture) and shows our guessed number-row slots were wrong
+  (e.g. `1` is index **20**, not the guessed 4).
+- This also **supersedes the GMK67 `positions_custom` guess** for per-key LEDs:
+  use `light_index` directly as the 128-slot framebuffer position.
+
+> The file's model naming is inconsistent ("Keyboard87" / "Layout109K", image
+> `k870T`), but the key set is the 68%/65% layout and the map is **CONFIRMED ON
+> HARDWARE (2026-06-04)**: `ek68_smoke.py --key N` lit exactly the expected key
+> (1→Esc, 56→A, 94→Space). This also validated the per-key Direct path + keepalive.
+
+**Map (physical row → `key/light_index`, with HID `code`):**
+
+- **Row 0:** Esc `0x29`/1 · 1 `0x1e`/20 · 2 `0x1f`/21 · 3 `0x20`/22 · 4 `0x21`/23 ·
+  5 `0x22`/24 · 6 `0x23`/25 · 7 `0x24`/26 · 8 `0x25`/27 · 9 `0x26`/28 · 0 `0x27`/29 ·
+  `-` `0x2d`/30 · `=` `0x2e`/31 · Backspace `0x2a`/103
+- **Row 1:** Tab `0x2b`/37 · Q `0x14`/38 · W `0x1a`/39 · E `0x08`/40 · R `0x15`/41 ·
+  T `0x17`/42 · Y `0x1c`/43 · U `0x18`/44 · I `0x0c`/45 · O `0x12`/46 · P `0x13`/47 ·
+  `[` `0x2f`/48 · `]` `0x30`/49 · `\` `0x31`/67 · Del `0x4c`/119
+- **Row 2:** Caps `0x39`/55 · A `0x04`/56 · S `0x16`/57 · D `0x07`/58 · F `0x09`/59 ·
+  G `0x0a`/60 · H `0x0b`/61 · J `0x0d`/62 · K `0x0e`/63 · L `0x0f`/64 · `;` `0x33`/65 ·
+  `'` `0x34`/66 · Enter `0x28`/85 · PageUp `0x4b`/118
+- **Row 3:** LShift `0xe1`/73 · Z `0x1d`/74 · X `0x1b`/75 · C `0x06`/76 · V `0x19`/77 ·
+  B `0x05`/78 · N `0x11`/79 · M `0x10`/80 · `,` `0x36`/81 · `.` `0x37`/82 · `/` `0x38`/83 ·
+  RShift `0xe5`/84 · Up `0x52`/101 · PageDown `0x4e`/121
+- **Row 4:** LCtrl `0xe0`/91 · Win `0xe3`/92 · LAlt `0xe2`/93 · Space `0x2c`/94 ·
+  RAlt `0xe6`/95 · Fn `0xaf`/96 · Left `0x50`/99 · Down `0x51`/100 · Right `0x4f`/102
+
+**Uses for the driver:**
+- **Per-key lighting:** to colour a key, write its `light_index` slot —
+  `color_buf[idx*4] = idx`, `+1..3 = R,G,B` (idx ≤ 121 fits the 128-slot / 8-page
+  buffer). Drop the GMK67 `positions_custom` remap; use this map.
+- **Remap:** address the source key by `key_index` in the key-definition write
+  (`0x11`) — resolves the §3.3 "can't uniquely address keys from captures" ceiling.
+  (Confirm whether the write is `key_index`-paged like the LED area.)
+- **Matrix abstraction:** 5 physical rows (by `rect_top`), ≤15 cols (by
+  `rect_left`); the firmware addresses by flat index, so clackd's `(row,col)` is
+  a convenience layer over `key_index`.
+
+---
+
 ## 4. Matrix / topology  (for clackd `get_matrix_dimensions` / `get_layer_count`)
 
 | Field | Value |
