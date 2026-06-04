@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # EK68 direct-HID diagnostic (Windows/Linux, via hidapi). Drives the keyboard's
-# interface-0 64-byte Feature report. See docs/protocol/epomaker-ek68.md §3.6.
+# interface-0 64-byte Feature report. See docs/protocol/epomaker-ek68.md section 4.
 #
 #   pip install hidapi
 #   python tools/ek68_hwdiag.py get                 # read the (paged) per-key framebuffer
@@ -12,7 +12,7 @@
 #       # replay a capture's SET frames (and optionally interleave GET reads).
 #       # needs tshark on PATH or at C:\Program Files\Wireshark\tshark.exe
 #
-# RESOLVED (§3.6): rendering is a multi-frame TRANSACTION (PACKET_HEADER 0x04),
+# Rendering is a multi-frame TRANSACTION (PACKET_HEADER 0x04, doc section 3),
 # not a single frame — `color`/`off` below now send the full sequence. The
 # `replay` of bare mode frames is kept only for forensic comparison.
 
@@ -34,7 +34,7 @@ def read(h):                  # paced GET the firmware expects between SETs
     except Exception: pass
 
 def update_mode(h, mode, r=0, g=0, b=0, bri=0x0F, spd=0):
-    # Transaction A (§3.6): customization-on, start-page, mode frame, end, start.
+    # Transaction (doc section 4.3): customization-on, start-page, mode frame, end, start.
     send(h, [(0,0x04),(1,0x18)]);                 read(h)   # TURN_ON_CUSTOMIZATION
     send(h, [(0,0x04),(1,0x13),(8,0x01)]);        read(h)   # WRITE_LED_SPECIAL_EFFECT_AREA
     send(h, [(0,mode),(1,r),(2,g),(3,b),(9,bri),(10,spd),(14,0xAA),(15,0x55)]); read(h)

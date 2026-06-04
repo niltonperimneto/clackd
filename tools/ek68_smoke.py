@@ -14,7 +14,7 @@
 #   StartEffectCommand    04 F0                -> Send
 #
 # Decoded from OpenRGB issue #4512 / gitlab.com/aethernali.live/OpenRGB branch
-# `gmk67`. Full spec: docs/protocol/epomaker-ek68.md §3.6.
+# `gmk67`. Full spec: docs/protocol/epomaker-ek68.md section 4.
 #
 # Cross-platform (Windows / Linux / macOS) via hidapi:
 #     pip install hidapi
@@ -89,7 +89,7 @@ def mode_frame(mode, r, g, b, brightness=BRIGHTNESS_MAX, speed=0x00,
     return f
 
 
-# Key map from the vendor KeyboardLayout.xml (docs §3.7): name -> (hid_code, index).
+# Key map from the vendor KeyboardLayout.xml (docs section 6): name -> (hid_code, index).
 # For this board key_index == light_index, and the remap write goes to the
 # key-definition area at absolute offset index*4. Basic VIA keycodes == HID code.
 KEYS = {
@@ -112,7 +112,7 @@ KEYS = {
 
 
 def keydef_commit(h, entries):
-    """Write the 9-page key-definition area (§3.8). `entries`: {key_index: keycode}.
+    """Write the 9-page key-definition area (section 5). `entries`: {key_index: keycode}.
 
     Each key's 4-byte entry [0x02, 0x00, kc_lo, kc_hi] sits at absolute offset
     index*4 across the 576-byte buffer. Zero entries keep the factory default, so
@@ -163,7 +163,7 @@ def read(h):
 
 def update_mode(h, mode, r=0, g=0, b=0, brightness=BRIGHTNESS_MAX, speed=0x00,
                 direction=0x00, random=False):
-    """The full effect/static render transaction (A in §3.6)."""
+    """The full effect/static render transaction (section 4.3)."""
     send(h, cmd_frame(TURN_ON_CUSTOMIZATION_COMMAND)); read(h)
     send(h, cmd_frame(WRITE_LED_SPECIAL_EFFECT_AREA_COMMAND,
                       {8: LED_SPECIAL_EFFECT_PACKETS})); read(h)
@@ -190,7 +190,7 @@ def send_leds_buffer(h, colors):
 
 
 def send_direct(h, colors):
-    """Per-key Direct mode (B in §3.6). Volatile -- needs a <=2s keepalive."""
+    """Per-key Direct mode (section 4.4). Volatile -- needs a <=2s keepalive."""
     # Header: [0]=PACKET_HEADER, [1]=DIRECT_MODE_VALUE, [8]=0x08.
     send(h, cmd_frame(DIRECT_MODE_VALUE, {8: 0x08}))
     send_leds_buffer(h, colors)
@@ -245,13 +245,13 @@ def key_demo(h, idx, seconds=6.0):
         n += 1
         time.sleep(1.0)  # keepalive <= 2s
     print(f"  -> {n} refreshes. The key that lit has light_index = {idx} "
-          "(cross-check docs/protocol/epomaker-ek68.md §3.7).")
+          "(cross-check docs/protocol/epomaker-ek68.md section 6).")
 
 
 def direct_demo(h, seconds=6.0):
     print("\nDIRECT (per-key) DEMO -- volatile, refreshed every 1s for "
           f"{seconds:.0f}s. Watch the keyboard.\n")
-    # All 66 LEDs green (slot order = LED index; see §3.6 map).
+    # All 66 LEDs green (slot order = LED index; see section 6 map).
     colors = [(0x00, 0xFF, 0x00)] * 66
     t0 = time.time()
     n = 0
@@ -265,7 +265,7 @@ def direct_demo(h, seconds=6.0):
 
 def remap_experiment(h, key_name="J"):
     print("\nREMAP EXPERIMENT -- this WRITES THE EEPROM (a few cycles). "
-          f"We remap '{key_name}' -> A via the key-definition area (§3.8), "
+          f"We remap '{key_name}' -> A via the key-definition area (section 5), "
           "you test it, then we restore it.\n")
     if key_name not in KEYS:
         sys.exit(f"unknown key '{key_name}'. Known: {', '.join(KEYS)}")
@@ -290,7 +290,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="list EK68 HID interfaces and exit")
     ap.add_argument("--direct", action="store_true", help="run the per-key Direct mode demo")
     ap.add_argument("--key", type=int, metavar="N",
-                    help="light ONLY light_index N green (verify the §3.7 key map)")
+                    help="light ONLY light_index N green (verify the section 6 key map)")
     ap.add_argument("--remap", nargs="?", const="J", metavar="KEY",
                     help="remap KEY (default J) -> A via the key-definition area, then restore (writes EEPROM)")
     args = ap.parse_args()

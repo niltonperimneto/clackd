@@ -13,7 +13,8 @@
 //!
 //! The EK68 is firmware-identical to the **Zuoya GMK67** (same `05ac:024f`,
 //! interface 0, usage `0001:0006`), reverse-engineered for OpenRGB by Aubry
-//! Flora. The full record lives in `docs/protocol/epomaker-ek68.md` §3.6; the
+//! Flora. The full record lives in `docs/protocol/epomaker-ek68.md` section 4;
+//! the
 //! load-bearing facts this module encodes:
 //!
 //! ## Lighting — a multi-frame *transaction* (the crucial point)
@@ -102,7 +103,7 @@ const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 
 // --- Transaction framing (byte 0 = PACKET_HEADER, byte 1 = command) ---------
 //
-// These are the frames previously misread as "heartbeats". See §3.6.
+// These are the frames previously misread as "heartbeats". See doc section 3.
 const PACKET_HEADER: u8 = 0x04;
 const CMD_COMMUNICATION_END: u8 = 0x02;
 const CMD_WRITE_LED_SPECIAL_EFFECT_AREA: u8 = 0x13;
@@ -142,7 +143,7 @@ fn is_renderable_mode(mode: u8) -> bool {
     (MODE_STATIC..=MODE_EFFECT_MAX).contains(&mode) || mode == MODE_LIGHTS_OFF
 }
 
-// --- Key-definition (remap) area (confirmed on hardware — see §3.8) ---
+// --- Key-definition (remap) area (confirmed on hardware — see doc section 5) ---
 //
 // A remap writes the 9-page (576-byte) key-definition area (cmd `0x11`), wrapped
 // in the same transaction as lighting. Each key's 4-byte entry sits at absolute
@@ -159,7 +160,7 @@ const EK68_ROWS: usize = 5;
 const EK68_COLS: usize = 15;
 
 /// Physical `(row, col)` → firmware `key_index`, from the vendor
-/// `KeyboardLayout.xml` (docs/protocol/epomaker-ek68.md §3.7). Rows are
+/// `KeyboardLayout.xml` (docs/protocol/epomaker-ek68.md section 6). Rows are
 /// top→bottom, cols left→right; `NA` marks an empty cell. The same index is the
 /// LED slot (`key_index == light_index` on this board).
 const KEY_INDEX: [[u8; EK68_COLS]; EK68_ROWS] = [
@@ -476,7 +477,7 @@ impl EpomakerDriver {
         }
     }
 
-    /// Runs the full effect/static render transaction (§3.6 path A). Without
+    /// Runs the full effect/static render transaction (doc section 4.3). Without
     /// the surrounding `0x04`-header framing the mode frame renders nothing.
     async fn render_effect(&mut self, lighting: Lighting) -> Result<(), DriverError> {
         self.io.set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION)).await?;
@@ -493,7 +494,7 @@ impl EpomakerDriver {
 
     /// Sends the full key-definition (remap) transaction for `entries`
     /// (`key_index -> keycode`): customization-on → start-keydef-page → 9 pages
-    /// → end → effect-start, each `Send` paced by a `Read` (§3.8).
+    /// → end → effect-start, each `Send` paced by a `Read` (doc section 5).
     async fn commit_keymap(&self, entries: &[(u8, u16)]) -> Result<(), DriverError> {
         let buf = encode_keydef_buffer(entries);
         self.io.set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION)).await?;
@@ -565,7 +566,7 @@ impl KeyboardDriver for EpomakerDriver {
         Ok(self.lighting.to_bytes())
     }
 
-    /// Flushes the keymap to the device's key-definition area (§3.8). Sends the
+    /// Flushes the keymap to the device's key-definition area (doc section 5). Sends the
     /// **full base-layer keymap** (not just the dirty set): zero entries keep the
     /// factory default, so re-sending everything avoids resetting previously
     /// remapped keys.
@@ -577,7 +578,7 @@ impl KeyboardDriver for EpomakerDriver {
         let mut fn_layer_skips: u32 = 0;
         for (&(layer, row, col), &keycode) in self.keymap.iter() {
             if layer != 0 {
-                // Fn-layer placement in the key-def area is not yet decoded (§3.8).
+                // Fn-layer placement in the key-def area is not yet decoded (doc section 5).
                 fn_layer_skips += 1;
                 continue;
             }

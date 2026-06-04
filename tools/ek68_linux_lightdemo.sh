@@ -12,7 +12,7 @@
 #   CLACKCTL=/path/to/clackctl ./tools/ek68_linux_lightdemo.sh hidraw3
 #
 # Lighting payload = [mode, R, G, B, brightness(0x00-0x0F), random, speed, dir];
-# modes: 01 static .. 13 effects, 80 = off (see docs §3.6). The clackctl
+# modes: 01 static .. 13 effects, 80 = off (see docs section 4). The clackctl
 # 'command' byte is unused by the EK68 driver (pass 0).
 set -euo pipefail
 
