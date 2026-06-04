@@ -43,7 +43,8 @@ REPORT_ID = 0x00
 
 PACKET_HEADER = 0x04
 COMMUNICATION_END_COMMAND = 0x02
-WRITE_KEY_DEFINITION_AREA_COMMAND = 0x11
+WRITE_KEY_DEFINITION_AREA_COMMAND = 0x11      # base layer
+WRITE_KEY_DEFINITION_AREA_FN_COMMAND = 0x27   # Fn layer (same layout)
 WRITE_LED_SPECIAL_EFFECT_AREA_COMMAND = 0x13
 TURN_ON_CUSTOMIZATION_COMMAND = 0x18
 TURN_OFF_CUSTOMIZATION_COMMAND = 0x19
@@ -111,12 +112,13 @@ KEYS = {
 }
 
 
-def keydef_commit(h, entries):
+def keydef_commit(h, entries, command=WRITE_KEY_DEFINITION_AREA_COMMAND):
     """Write the 9-page key-definition area (section 5). `entries`: {key_index: keycode}.
 
-    Each key's 4-byte entry [0x02, 0x00, kc_lo, kc_hi] sits at absolute offset
-    index*4 across the 576-byte buffer. Zero entries keep the factory default, so
-    pass the FULL desired keymap to avoid resetting other keys.
+    `command` selects the layer: 0x11 base, 0x27 Fn. Each key's 4-byte entry
+    [0x02, 0x00, kc_lo, kc_hi] sits at absolute offset index*4 across the 576-byte
+    buffer. Zero entries keep the factory default, so pass the FULL desired keymap
+    to avoid resetting other keys.
     """
     buf = bytearray(9 * FRAME_LEN)  # 576 bytes
     for idx, kc in entries.items():
@@ -127,7 +129,7 @@ def keydef_commit(h, entries):
     buf[8 * FRAME_LEN + 62] = 0xAA   # page-8 check code
     buf[8 * FRAME_LEN + 63] = 0x55
     send(h, cmd_frame(TURN_ON_CUSTOMIZATION_COMMAND)); read(h)
-    send(h, cmd_frame(WRITE_KEY_DEFINITION_AREA_COMMAND, {8: 0x09})); read(h)
+    send(h, cmd_frame(command, {8: 0x09})); read(h)
     for p in range(9):
         send(h, buf[p * FRAME_LEN:(p + 1) * FRAME_LEN]); read(h)
     send(h, cmd_frame(COMMUNICATION_END_COMMAND)); read(h)
@@ -263,24 +265,34 @@ def direct_demo(h, seconds=6.0):
     print("If the keys were green and stayed green, Direct mode + keepalive work.")
 
 
-def remap_experiment(h, key_name="J"):
-    print("\nREMAP EXPERIMENT -- this WRITES THE EEPROM (a few cycles). "
-          f"We remap '{key_name}' -> A via the key-definition area (section 5), "
+def remap_experiment(h, key_name="J", fn_layer=False):
+    layer = "Fn layer" if fn_layer else "base layer"
+    command = WRITE_KEY_DEFINITION_AREA_FN_COMMAND if fn_layer else WRITE_KEY_DEFINITION_AREA_COMMAND
+    press = f"Fn+'{key_name}'" if fn_layer else f"'{key_name}'"
+    print(f"\nREMAP EXPERIMENT ({layer}) -- this WRITES THE EEPROM (a few cycles). "
+          f"We remap {press} -> A via the key-definition area (section 5), "
           "you test it, then we restore it.\n")
     if key_name not in KEYS:
         sys.exit(f"unknown key '{key_name}'. Known: {', '.join(KEYS)}")
     code, index = KEYS[key_name]
     KC_A = 0x04
 
-    print(f"  Writing '{key_name}' (key_index {index}, offset {index*4}) -> KC_A ...")
-    keydef_commit(h, {index: KC_A})
-    input(f"  Open a text box and press the physical '{key_name}' key. "
-          "Did it type 'A'?  [press Enter to restore] ")
+    print(f"  Writing {press} (key_index {index}, offset {index*4}) -> KC_A "
+          f"via command 0x{command:02x} ...")
+    keydef_commit(h, {index: KC_A}, command)
+    input(f"  Open a text box and press {press}. Did it type 'A'?  "
+          "[press Enter to restore] ")
 
-    # Restore: basic VIA keycode == HID code, so writing the key's own code
-    # returns it to default without disturbing other keys.
-    print(f"  Restoring '{key_name}' -> default (0x{code:02x}) ...")
-    keydef_commit(h, {index: code})
+    if fn_layer:
+        # The Fn-layer factory default is not the HID code (often transparent),
+        # so restore by clearing the whole Fn layer to default.
+        print("  Restoring the Fn layer to default ...")
+        keydef_commit(h, {}, command)
+    else:
+        # Basic VIA keycode == HID code, so writing the key's own code restores
+        # it without disturbing other keys.
+        print(f"  Restoring '{key_name}' -> default (0x{code:02x}) ...")
+        keydef_commit(h, {index: code}, command)
     print("  Done. If the key is still wrong, use the Epomaker app's "
           "Reset-to-default. Report the result to the assistant.")
 
@@ -293,6 +305,8 @@ def main():
                     help="light ONLY light_index N green (verify the section 6 key map)")
     ap.add_argument("--remap", nargs="?", const="J", metavar="KEY",
                     help="remap KEY (default J) -> A via the key-definition area, then restore (writes EEPROM)")
+    ap.add_argument("--fn", action="store_true",
+                    help="with --remap, target the Fn layer (command 0x27) instead of the base layer")
     args = ap.parse_args()
 
     if args.list:
@@ -308,7 +322,7 @@ def main():
         elif not args.remap:
             lighting_demo(h)
         if args.remap:
-            remap_experiment(h, args.remap)
+            remap_experiment(h, args.remap, fn_layer=args.fn)
     finally:
         h.close()
 

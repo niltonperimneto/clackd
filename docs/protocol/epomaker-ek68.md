@@ -18,8 +18,8 @@ against the physical keyboard. See [Source attribution](#9-source-attribution).
 | Lighting: static, brightness, effects | Confirmed on hardware |
 | Per-key lighting (Direct / Custom) | Protocol confirmed; not yet exposed through clackd |
 | Keymap remap, base layer | Confirmed on hardware |
+| Keymap remap, Fn layer | Confirmed from capture (command `0x27`, same layout) |
 | Key / LED index map | Confirmed on hardware |
-| Fn-layer remap | Not yet decoded |
 | Macros | Not yet decoded |
 
 ## Scope
@@ -101,7 +101,8 @@ Command IDs (byte 1):
 |---|---|
 | `0x02` | End communication |
 | `0x05` | Get basic info |
-| `0x10` / `0x11` | Read / write key-definition area |
+| `0x10` / `0x11` | Read / write key-definition area (base layer) |
+| `0x27` | Write key-definition area (Fn layer) |
 | `0x12` | Read LED effect-definition area |
 | `0x13` | Write LED special-effect area |
 | `0x14` / `0x15` | Read / write macro-definition area |
@@ -109,6 +110,9 @@ Command IDs (byte 1):
 | `0x18` / `0x19` | Customization on / off |
 | `0xF0` | LED effect start |
 | `0xF1` / `0xF2` / `0xF3` | LED sync initial / start / stop |
+
+(Command `0x27` is not in the GMK67 OpenRGB source, which does not implement
+remapping; it was decoded from the EK68 Fn-remap captures.)
 
 Common constants:
 
@@ -205,13 +209,14 @@ Send  04 02                 End communication
 
 ## 5. Keymap / remap
 
-A remap writes the key-definition area (command `0x11`), a 9-page / 576-byte
-buffer, inside the transaction:
+A remap writes a per-layer key-definition area, a 9-page / 576-byte buffer,
+inside the transaction. The command selects the layer: `0x11` for the base layer
+and `0x27` for the Fn layer. The two areas are otherwise identical.
 
 ```
 Send  04 18                 Customization on
 Read
-Send  04 11  [byte 8]=09    Start key-definition page (9 packets)
+Send  04 NN  [byte 8]=09    Start key-definition page (NN = 0x11 base / 0x27 Fn)
 Read
 Send  <page 0> .. <page 8>  576-byte buffer; page 8 carries 0xAA 0x55
 Read  (after each page)     at bytes 62–63
@@ -243,8 +248,10 @@ Confirmed offsets (`offset = key_index * 4`): Esc(1) = 4, `1`(20) = 80,
 `5`(24) = 96, `=`(31) = 124, Tab(37) = 148, Q(38) = 152, Caps(55) = 220,
 Space(94) = 376.
 
-Only the base layer is decoded. The Fn-layer placement (a second region, or an
-offset within the 9 pages) requires an Fn-remap capture.
+The Fn layer uses the same offset scheme in its own area (command `0x27`),
+confirmed from the Fn-remap captures: Fn+A (key_index 56 → offset 224 → page 3,
+in-page offset 32) set to F9 (`0x42`) produced `[32]=02 [34]=42` in the `0x27`
+area. A commit sends one transaction per layer that has edits.
 
 ---
 
@@ -302,9 +309,9 @@ The driver's `KEY_INDEX` table in
 - **Lighting** — `set_lighting` runs the static/effect transaction (section 4.3).
   Brightness and speed are clamped to `0x00`–`0x0F`. Per-key Direct/Custom is not
   yet exposed through the `KeyboardDriver` trait.
-- **Remap** — `commit_to_nvram` sends the full base-layer keymap as the
-  key-definition transaction (section 5). Fn-layer edits are skipped with a
-  warning until layer-1 placement is decoded.
+- **Remap** — `commit_to_nvram` sends one key-definition transaction per layer
+  that has edits (base layer command `0x11`, Fn layer `0x27`; section 5), each
+  carrying that layer's full keymap.
 - **EEPROM wear** — the device writes the EEPROM on every key-definition commit;
   commits should be coalesced.
 - **Keymap read-back** — the device exposes no keymap read, so the driver keeps a
@@ -331,7 +338,6 @@ The key/LED index map is from the official Epomaker driver's
 
 ## 10. Open items
 
-- Fn-layer key-definition placement (needs an Fn-remap capture).
 - Macro format (commands `0x14` / `0x15`).
 - Per-key Direct lighting through the clackd engine, including the 2-second
   keepalive.

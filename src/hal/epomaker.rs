@@ -145,11 +145,15 @@ fn is_renderable_mode(mode: u8) -> bool {
 
 // --- Key-definition (remap) area (confirmed on hardware — see doc section 5) ---
 //
-// A remap writes the 9-page (576-byte) key-definition area (cmd `0x11`), wrapped
-// in the same transaction as lighting. Each key's 4-byte entry sits at absolute
-// offset `key_index * 4`: `[0x02, 0x00, kc_lo, kc_hi]` (16-bit LE VIA/QMK code).
-// Zero entries keep the factory default, so a commit sends the *full* keymap.
-const CMD_WRITE_KEY_DEFINITION_AREA: u8 = 0x11;
+// A remap writes the 9-page (576-byte) key-definition area, wrapped in the same
+// transaction as lighting. Each key's 4-byte entry sits at absolute offset
+// `key_index * 4`: `[0x02, 0x00, kc_lo, kc_hi]` (16-bit LE VIA/QMK code). Zero
+// entries keep the factory default, so a commit sends the *full* keymap.
+//
+// The base layer uses command 0x11 and the Fn layer command 0x27; the layout is
+// otherwise identical (confirmed from the Fn-remap capture).
+const CMD_WRITE_KEY_DEFINITION_AREA: u8 = 0x11; // layer 0 (base)
+const CMD_WRITE_KEY_DEFINITION_AREA_FN: u8 = 0x27; // layer 1 (Fn)
 const KEY_DEF_PAGES: usize = 9;
 const KEY_DEF_BUF_LEN: usize = KEY_DEF_PAGES * FRAME_LEN; // 576
 const KEY_DEF_ENTRY_MARKER: u8 = 0x02;
@@ -176,6 +180,17 @@ const KEY_INDEX: [[u8; EK68_COLS]; EK68_ROWS] = [
 fn key_index_for(row: u8, col: u8) -> Option<u8> {
     let ki = *KEY_INDEX.get(row as usize)?.get(col as usize)?;
     (ki != NA).then_some(ki)
+}
+
+/// Maps a clackd layer to its key-definition-area command. The base layer is
+/// written with `0x11`, the Fn layer with `0x27`; the page/offset layout is
+/// identical. Returns `None` for layers the device does not expose.
+fn keydef_command(layer: u8) -> Option<u8> {
+    match layer {
+        0 => Some(CMD_WRITE_KEY_DEFINITION_AREA),
+        1 => Some(CMD_WRITE_KEY_DEFINITION_AREA_FN),
+        _ => None,
+    }
 }
 
 // -- HIDIOCSFEATURE / HIDIOCGFEATURE ioctl wrappers --
@@ -379,9 +394,10 @@ fn encode_start_effect_page() -> [u8; FRAME_LEN] {
     f
 }
 
-/// `StartKeyDefPage`: announces the 9 key-definition packets that follow.
-fn encode_start_keydef_page() -> [u8; FRAME_LEN] {
-    let mut f = encode_cmd(CMD_WRITE_KEY_DEFINITION_AREA);
+/// `StartKeyDefPage`: announces the 9 key-definition packets that follow, for
+/// the given layer command (`0x11` base / `0x27` Fn).
+fn encode_start_keydef_page(command: u8) -> [u8; FRAME_LEN] {
+    let mut f = encode_cmd(command);
     f[8] = KEY_DEF_PAGES as u8; // 0x09
     f
 }
@@ -492,14 +508,16 @@ impl EpomakerDriver {
         Ok(())
     }
 
-    /// Sends the full key-definition (remap) transaction for `entries`
-    /// (`key_index -> keycode`): customization-on → start-keydef-page → 9 pages
-    /// → end → effect-start, each `Send` paced by a `Read` (doc section 5).
-    async fn commit_keymap(&self, entries: &[(u8, u16)]) -> Result<(), DriverError> {
+    /// Sends the full key-definition (remap) transaction for one layer:
+    /// customization-on → start-keydef-page(`command`) → 9 pages → end →
+    /// effect-start, each `Send` paced by a `Read` (doc section 5). `command`
+    /// selects the layer's area (`0x11` base / `0x27` Fn); `entries` is
+    /// `key_index -> keycode` for that layer.
+    async fn commit_keymap(&self, command: u8, entries: &[(u8, u16)]) -> Result<(), DriverError> {
         let buf = encode_keydef_buffer(entries);
         self.io.set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION)).await?;
         self.read_ack().await;
-        self.io.set_feature(encode_start_keydef_page()).await?;
+        self.io.set_feature(encode_start_keydef_page(command)).await?;
         self.read_ack().await;
         for p in 0..KEY_DEF_PAGES {
             let mut page = [0u8; FRAME_LEN];
@@ -566,42 +584,41 @@ impl KeyboardDriver for EpomakerDriver {
         Ok(self.lighting.to_bytes())
     }
 
-    /// Flushes the keymap to the device's key-definition area (doc section 5). Sends the
-    /// **full base-layer keymap** (not just the dirty set): zero entries keep the
-    /// factory default, so re-sending everything avoids resetting previously
-    /// remapped keys.
+    /// Flushes the keymap to the device's key-definition areas (doc section 5).
+    /// One transaction per layer that has pending edits (base layer → command
+    /// `0x11`, Fn layer → `0x27`). For each such layer the **full** layer keymap
+    /// is sent (zero entries keep the factory default), so re-sending never
+    /// resets previously remapped keys.
     async fn commit_to_nvram(&mut self) -> Result<(), DriverError> {
         if self.dirty.is_empty() {
             return Ok(());
         }
-        let mut entries: Vec<(u8, u16)> = Vec::new();
-        let mut fn_layer_skips: u32 = 0;
-        for (&(layer, row, col), &keycode) in self.keymap.iter() {
-            if layer != 0 {
-                // Fn-layer placement in the key-def area is not yet decoded (doc section 5).
-                fn_layer_skips += 1;
+        let mut dirty_layers: Vec<u8> = self.dirty.keys().map(|&(layer, _, _)| layer).collect();
+        dirty_layers.sort_unstable();
+        dirty_layers.dedup();
+
+        for layer in dirty_layers {
+            let Some(command) = keydef_command(layer) else {
+                warn!(device_id = %self.device_id, layer, "EK68 layer has no key-definition area; skipping");
                 continue;
+            };
+            let mut entries: Vec<(u8, u16)> = Vec::new();
+            for (&(l, row, col), &keycode) in self.keymap.iter() {
+                if l != layer {
+                    continue;
+                }
+                match key_index_for(row, col) {
+                    Some(ki) => entries.push((ki, keycode)),
+                    None => warn!(
+                        device_id = %self.device_id,
+                        layer, row, col, "skipping remap — no key at matrix position",
+                    ),
+                }
             }
-            match key_index_for(row, col) {
-                Some(ki) => entries.push((ki, keycode)),
-                None => warn!(
-                    device_id = %self.device_id,
-                    row, col, "skipping remap — no key at matrix position",
-                ),
+            if !entries.is_empty() {
+                self.commit_keymap(command, &entries).await?;
             }
         }
-        if fn_layer_skips > 0 {
-            warn!(
-                device_id = %self.device_id,
-                count = fn_layer_skips,
-                "EK68 Fn-layer edits not flushed — key-def placement for layer 1 is undecoded",
-            );
-        }
-        if entries.is_empty() {
-            self.dirty.clear();
-            return Ok(());
-        }
-        self.commit_keymap(&entries).await?;
         self.dirty.clear();
         Ok(())
     }
@@ -811,6 +828,13 @@ mod tests {
     }
 
     #[test]
+    fn keydef_command_per_layer() {
+        assert_eq!(keydef_command(0), Some(CMD_WRITE_KEY_DEFINITION_AREA)); // 0x11
+        assert_eq!(keydef_command(1), Some(CMD_WRITE_KEY_DEFINITION_AREA_FN)); // 0x27
+        assert_eq!(keydef_command(2), None);
+    }
+
+    #[test]
     fn keydef_buffer_places_entry_at_index_times_4() {
         // Esc (key_index 1) and Space (key_index 94) -> KC_A (little-endian).
         let buf = encode_keydef_buffer(&[(1, 0x0004), (94, 0x0004)]);
@@ -918,6 +942,36 @@ mod tests {
         assert_eq!(sent[2][4], KEY_DEF_ENTRY_MARKER); // Esc in page 0
         assert_eq!(sent[2 + 3][56], KEY_DEF_ENTRY_MARKER); // J in page 3
         assert_eq!(sent[2 + 3][58], 0x05); // KC_B low byte
+    }
+
+    #[tokio::test]
+    async fn fn_layer_remap_uses_command_0x27() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        d.set_keycode(1, 2, 1, 0x0042).await.unwrap(); // Fn layer, A (key_index 56) -> F9
+        d.commit_to_nvram().await.unwrap();
+        let sent = io.sent();
+        assert_eq!(sent.len(), 2 + KEY_DEF_PAGES + 2);
+        // Fn layer is written with command 0x27, not 0x11.
+        assert_eq!(sent[1][1], CMD_WRITE_KEY_DEFINITION_AREA_FN);
+        // A (key_index 56) -> offset 224 -> page 3, in-page offset 32.
+        assert_eq!(sent[2 + 3][32], KEY_DEF_ENTRY_MARKER);
+        assert_eq!(sent[2 + 3][34], 0x42);
+    }
+
+    #[tokio::test]
+    async fn commit_sends_one_transaction_per_dirty_layer() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        d.set_keycode(0, 0, 0, 0x0004).await.unwrap(); // base: Esc -> A
+        d.set_keycode(1, 0, 0, 0x0042).await.unwrap(); // Fn:   Esc -> F9
+        d.commit_to_nvram().await.unwrap();
+        let sent = io.sent();
+        let txn = 2 + KEY_DEF_PAGES + 2; // 13 frames per layer transaction
+        assert_eq!(sent.len(), 2 * txn);
+        // Layers committed in order: base (0x11) then Fn (0x27).
+        assert_eq!(sent[1][1], CMD_WRITE_KEY_DEFINITION_AREA);
+        assert_eq!(sent[txn + 1][1], CMD_WRITE_KEY_DEFINITION_AREA_FN);
     }
 
     #[tokio::test]
