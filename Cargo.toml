@@ -26,9 +26,9 @@
 
 [package]
 name = "clackd"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
-rust-version = "1.95.0"
+rust-version = "1.96.0"
 license = "GPL-3.0-or-later"
 
 [dependencies]
