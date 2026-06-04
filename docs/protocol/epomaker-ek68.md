@@ -264,6 +264,10 @@ delivers the new keycode. The buffer **wraps/pages** after filling. Net effect:
 
 ### 3.3 Passive-sniffing ceiling reached (remap addressing)
 
+> **RESOLVED in §3.8.** The ceiling was lifted not by more captures but by the
+> vendor `KeyboardLayout.xml` `key_index` (§3.7): the write offset is
+> `key_index × 4` in a 9-page key-definition area. Kept here for history.
+
 A fully-unfiltered single remap (`E → F9`, post-reset) produced **only** the write
 `02 00 42 @ offset 32` plus generic heartbeats (`04 18`, `04 11…09`, `04 02`, `04 f0`).
 The byte-identical write is what `5 → F9` produces too. **There is no key/row/scancode
@@ -593,6 +597,59 @@ LED framebuffer slot for `SendDirect`/`SendCustom`).
 - **Matrix abstraction:** 5 physical rows (by `rect_top`), ≤15 cols (by
   `rect_left`); the firmware addresses by flat index, so clackd's `(row,col)` is
   a convenience layer over `key_index`.
+
+---
+
+## 3.8 RESOLVED — Keymap / remap (key-definition area write, confirmed from captures)
+
+> ✅ The §3.2/§3.3 "passive-sniffing ceiling" is **lifted**: with `key_index`
+> from §3.7 in hand, the remap addressing decodes exactly. Verified across
+> `ek68-pos`, `ek68-shuf`, `ek68-remap`, `ek68-remap2`, and **confirmed live on
+> hardware (2026-06-04)**: `ek68_smoke.py --remap` made physical J type A, then
+> restored it. Implemented in `src/hal/epomaker.rs` (`commit_to_nvram`).
+
+A remap writes the **key-definition area** (cmd `0x11`,
+`WRITE_KEY_DEFINITION_AREA_COMMAND`), a **9-page / 576-byte buffer**, wrapped in
+the same transaction shape as lighting:
+
+```
+04 18                       SetCustomization(ON)          Send → Read
+04 11  [8]=09               StartKeyDefPage (9 packets)   Send → Read
+<page 0> … <page 8>         the 576-byte key-def buffer    Send ×9 (paced by Read)
+                            page 8 carries 62=AA 63=55 (check code)
+04 02                       EndCommunication              Send → Read
+04 F0                       StartEffectCommand (re-render) Send
+```
+
+**Per-key entry (4 bytes) at absolute offset `key_index × 4`:**
+```
+off+0 : 0x02            "set this key" marker
+off+1 : 0x00
+off+2 : keycode low   } 16-bit little-endian VIA/QMK keycode (KC_A = 0x0004)
+off+3 : keycode high  }
+```
+The page for a key is `(key_index*4) / 64`; its in-page offset is
+`(key_index*4) % 64`. **Confirmed** (offset = `key_index×4`):
+Esc(1)=4, `1`(20)=80, `5`(24)=96, `=`(31)=124, Tab(37)=148, Q(38)=152,
+Caps(55)=220, Space(94)=376.
+
+**Rules:**
+- The app sends **all 9 pages** in order each commit; **zero entries = keep
+  factory default**, non-zero (marker `0x02`) = override. So to avoid resetting a
+  previously-remapped key, send the **full cumulative keymap**, not just the new
+  edit.
+- The `02 00 <scancode>` **select** frame seen in some captures is UI scratch
+  (highlights the key on screen); it is **not required** for the write. This is
+  why two physical keys could look identical in passive captures (§3.3) — the
+  disambiguator is the *write offset* (`key_index×4`), which a one-key capture
+  with the on-screen click doesn't vary.
+- keycodes are standard VIA/QMK 16-bit LE.
+
+**Open (hardware):**
+- Only **base layer** was captured. The Fn layer's placement (a second key-def
+  region, or `key_index` + fixed offset within the 9 pages — 144 slots fit
+  66 keys × 2 layers) is `TODO` — needs an Fn-remap capture.
+- The board writes EEPROM live; coalesce commits (CLAUDE.md §4.2).
 
 ---
 

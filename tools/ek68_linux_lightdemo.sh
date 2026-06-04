@@ -29,4 +29,4 @@ step "bright white" 01ffffff1000
 step "spectrum"     08ff00001001
 step "LED off"      000000000100
 step "white"        01ffffff1000
-echo "Done. If the colors matched the labels, the driver works end-to-end. ✅"
+echo "Done. If the colors matched the labels, the driver works end-to-end."

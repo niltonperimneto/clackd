@@ -43,6 +43,7 @@ REPORT_ID = 0x00
 
 PACKET_HEADER = 0x04
 COMMUNICATION_END_COMMAND = 0x02
+WRITE_KEY_DEFINITION_AREA_COMMAND = 0x11
 WRITE_LED_SPECIAL_EFFECT_AREA_COMMAND = 0x13
 TURN_ON_CUSTOMIZATION_COMMAND = 0x18
 TURN_OFF_CUSTOMIZATION_COMMAND = 0x19
@@ -88,19 +89,49 @@ def mode_frame(mode, r, g, b, brightness=BRIGHTNESS_MAX, speed=0x00,
     return f
 
 
-def select_frame(scancode):
-    f = bytearray(FRAME_LEN)
-    f[20] = 0x02
-    f[22] = scancode
-    return f
+# Key map from the vendor KeyboardLayout.xml (docs §3.7): name -> (hid_code, index).
+# For this board key_index == light_index, and the remap write goes to the
+# key-definition area at absolute offset index*4. Basic VIA keycodes == HID code.
+KEYS = {
+    "esc": (0x29, 1), "1": (0x1e, 20), "2": (0x1f, 21), "3": (0x20, 22), "4": (0x21, 23),
+    "5": (0x22, 24), "6": (0x23, 25), "7": (0x24, 26), "8": (0x25, 27), "9": (0x26, 28),
+    "0": (0x27, 29), "-": (0x2d, 30), "=": (0x2e, 31), "backspace": (0x2a, 103),
+    "tab": (0x2b, 37), "Q": (0x14, 38), "W": (0x1a, 39), "E": (0x08, 40), "R": (0x15, 41),
+    "T": (0x17, 42), "Y": (0x1c, 43), "U": (0x18, 44), "I": (0x0c, 45), "O": (0x12, 46),
+    "P": (0x13, 47), "[": (0x2f, 48), "]": (0x30, 49), "\\": (0x31, 67), "del": (0x4c, 119),
+    "caps": (0x39, 55), "A": (0x04, 56), "S": (0x16, 57), "D": (0x07, 58), "F": (0x09, 59),
+    "G": (0x0a, 60), "H": (0x0b, 61), "J": (0x0d, 62), "K": (0x0e, 63), "L": (0x0f, 64),
+    ";": (0x33, 65), "'": (0x34, 66), "enter": (0x28, 85), "pageup": (0x4b, 118),
+    "lshift": (0xe1, 73), "Z": (0x1d, 74), "X": (0x1b, 75), "C": (0x06, 76), "V": (0x19, 77),
+    "B": (0x05, 78), "N": (0x11, 79), "M": (0x10, 80), ",": (0x36, 81), ".": (0x37, 82),
+    "/": (0x38, 83), "rshift": (0xe5, 84), "up": (0x52, 101), "pagedown": (0x4e, 121),
+    "lctrl": (0xe0, 91), "win": (0xe3, 92), "lalt": (0xe2, 93), "space": (0x2c, 94),
+    "ralt": (0xe6, 95), "fn": (0xaf, 96), "left": (0x50, 99), "down": (0x51, 100),
+    "right": (0x4f, 102),
+}
 
 
-def write_frame(keycode, offset=4):
-    f = bytearray(FRAME_LEN)
-    f[offset] = 0x02
-    f[offset + 2] = keycode & 0xFF
-    f[offset + 3] = (keycode >> 8) & 0xFF
-    return f
+def keydef_commit(h, entries):
+    """Write the 9-page key-definition area (§3.8). `entries`: {key_index: keycode}.
+
+    Each key's 4-byte entry [0x02, 0x00, kc_lo, kc_hi] sits at absolute offset
+    index*4 across the 576-byte buffer. Zero entries keep the factory default, so
+    pass the FULL desired keymap to avoid resetting other keys.
+    """
+    buf = bytearray(9 * FRAME_LEN)  # 576 bytes
+    for idx, kc in entries.items():
+        o = idx * 4
+        buf[o + 0] = 0x02
+        buf[o + 2] = kc & 0xFF
+        buf[o + 3] = (kc >> 8) & 0xFF
+    buf[8 * FRAME_LEN + 62] = 0xAA   # page-8 check code
+    buf[8 * FRAME_LEN + 63] = 0x55
+    send(h, cmd_frame(TURN_ON_CUSTOMIZATION_COMMAND)); read(h)
+    send(h, cmd_frame(WRITE_KEY_DEFINITION_AREA_COMMAND, {8: 0x09})); read(h)
+    for p in range(9):
+        send(h, buf[p * FRAME_LEN:(p + 1) * FRAME_LEN]); read(h)
+    send(h, cmd_frame(COMMUNICATION_END_COMMAND)); read(h)
+    send(h, cmd_frame(LED_EFFECT_START_COMMAND))
 
 # ---- device plumbing --------------------------------------------------------
 
@@ -196,7 +227,7 @@ def lighting_demo(h):
         update_mode(h, mode, r, g, b, brightness=bri, speed=0x08, random=rnd)
         print(f"  -> {label}")
         time.sleep(1.5)
-    print("\nIf the colors/effects matched the labels, the lighting protocol is confirmed. ✅")
+    print("\nIf the colors/effects matched the labels, the lighting protocol is confirmed.")
 
 
 def key_demo(h, idx, seconds=6.0):
@@ -229,37 +260,29 @@ def direct_demo(h, seconds=6.0):
         n += 1
         time.sleep(1.0)  # keepalive interval must be <= 2s
     print(f"  -> streamed {n} Direct refreshes (all keys green).")
-    print("If the keys were green and stayed green, Direct mode + keepalive work. ✅")
+    print("If the keys were green and stayed green, Direct mode + keepalive work.")
 
 
-def remap_experiment(h):
+def remap_experiment(h, key_name="J"):
     print("\nREMAP EXPERIMENT -- this WRITES THE EEPROM (a few cycles). "
-          "We remap the 'E' key, you test it, then we restore it.\n")
-    KC_A, SCAN_E, KC_E = 0x04, 0x08, 0x08  # KC_A=0x04; E's scancode and KC_E are both 0x08
-    candidates = [
-        ("A: select(E)@20 + write(A)@4",  [select_frame(SCAN_E), write_frame(KC_A, offset=4)]),
-        ("B: select(E)@20 + write(A)@32", [select_frame(SCAN_E), write_frame(KC_A, offset=32)]),
-        ("C: write(A)@32 only",           [write_frame(KC_A, offset=32)]),
-    ]
-    hit = None
-    for label, frames in candidates:
-        print(f"\nTrying {label}")
-        for fr in frames:
-            send(h, fr)
-            time.sleep(0.2)
-        ans = input("  Open a text box and press the physical 'E' key. Did it type 'A'? [y/N] ").strip().lower()
-        if ans == "y":
-            hit = label
-            break
-    print("\nRestoring 'E' to default...")
-    send(h, select_frame(SCAN_E)); time.sleep(0.2)
-    send(h, write_frame(KC_E, offset=4))
-    send(h, write_frame(KC_E, offset=32))
-    if hit:
-        print(f"\n✅ Remap worked with strategy [{hit}] -- tell the assistant; that fixes the driver's offset.")
-    else:
-        print("\nNone of the strategies remapped 'E'. Tell the assistant -- we'll try other offsets/selects.")
-    print("If 'E' is still typing 'A', use the Epomaker app's Reset-to-default to fully restore.")
+          f"We remap '{key_name}' -> A via the key-definition area (§3.8), "
+          "you test it, then we restore it.\n")
+    if key_name not in KEYS:
+        sys.exit(f"unknown key '{key_name}'. Known: {', '.join(KEYS)}")
+    code, index = KEYS[key_name]
+    KC_A = 0x04
+
+    print(f"  Writing '{key_name}' (key_index {index}, offset {index*4}) -> KC_A ...")
+    keydef_commit(h, {index: KC_A})
+    input(f"  Open a text box and press the physical '{key_name}' key. "
+          "Did it type 'A'?  [press Enter to restore] ")
+
+    # Restore: basic VIA keycode == HID code, so writing the key's own code
+    # returns it to default without disturbing other keys.
+    print(f"  Restoring '{key_name}' -> default (0x{code:02x}) ...")
+    keydef_commit(h, {index: code})
+    print("  Done. If the key is still wrong, use the Epomaker app's "
+          "Reset-to-default. Report the result to the assistant.")
 
 
 def main():
@@ -268,7 +291,8 @@ def main():
     ap.add_argument("--direct", action="store_true", help="run the per-key Direct mode demo")
     ap.add_argument("--key", type=int, metavar="N",
                     help="light ONLY light_index N green (verify the §3.7 key map)")
-    ap.add_argument("--remap", action="store_true", help="run the remap experiment (writes EEPROM)")
+    ap.add_argument("--remap", nargs="?", const="J", metavar="KEY",
+                    help="remap KEY (default J) -> A via the key-definition area, then restore (writes EEPROM)")
     args = ap.parse_args()
 
     if args.list:
@@ -281,10 +305,10 @@ def main():
             key_demo(h, args.key)
         elif args.direct:
             direct_demo(h)
-        else:
+        elif not args.remap:
             lighting_demo(h)
         if args.remap:
-            remap_experiment(h)
+            remap_experiment(h, args.remap)
     finally:
         h.close()
 

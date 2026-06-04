@@ -142,17 +142,40 @@ fn is_renderable_mode(mode: u8) -> bool {
     (MODE_STATIC..=MODE_EFFECT_MAX).contains(&mode) || mode == MODE_LIGHTS_OFF
 }
 
-// --- Remap frame layout ---
+// --- Key-definition (remap) area (confirmed on hardware — see §3.8) ---
 //
-// `02 00 <scancode>`           = select (which key)
-// `02 00 <kc_lo> <kc_hi>`      = write  (new keycode, 16-bit little-endian)
-//
-// The select/write offsets observed in the Windows driver are row-dependent
-// (a per-row column position, not a global slot). These constants are the
-// best-known starting point and are the single thing to confirm on hardware.
-const REMAP_MARKER: u8 = 0x02;
-const REMAP_SELECT_OFFSET: usize = 20;
-const REMAP_WRITE_OFFSET: usize = 4;
+// A remap writes the 9-page (576-byte) key-definition area (cmd `0x11`), wrapped
+// in the same transaction as lighting. Each key's 4-byte entry sits at absolute
+// offset `key_index * 4`: `[0x02, 0x00, kc_lo, kc_hi]` (16-bit LE VIA/QMK code).
+// Zero entries keep the factory default, so a commit sends the *full* keymap.
+const CMD_WRITE_KEY_DEFINITION_AREA: u8 = 0x11;
+const KEY_DEF_PAGES: usize = 9;
+const KEY_DEF_BUF_LEN: usize = KEY_DEF_PAGES * FRAME_LEN; // 576
+const KEY_DEF_ENTRY_MARKER: u8 = 0x02;
+
+/// Sentinel for a matrix cell with no key.
+const NA: u8 = 0xFF;
+const EK68_ROWS: usize = 5;
+const EK68_COLS: usize = 15;
+
+/// Physical `(row, col)` → firmware `key_index`, from the vendor
+/// `KeyboardLayout.xml` (docs/protocol/epomaker-ek68.md §3.7). Rows are
+/// top→bottom, cols left→right; `NA` marks an empty cell. The same index is the
+/// LED slot (`key_index == light_index` on this board).
+const KEY_INDEX: [[u8; EK68_COLS]; EK68_ROWS] = [
+    [1, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 103, NA],
+    [37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 67, 119],
+    [55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 85, 118, NA],
+    [73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 101, 121, NA],
+    [91, 92, 93, 94, 95, 96, 99, 100, 102, NA, NA, NA, NA, NA, NA],
+];
+
+/// Maps a matrix position to the firmware `key_index`, or `None` for an empty
+/// cell / out-of-bounds.
+fn key_index_for(row: u8, col: u8) -> Option<u8> {
+    let ki = *KEY_INDEX.get(row as usize)?.get(col as usize)?;
+    (ki != NA).then_some(ki)
+}
 
 // -- HIDIOCSFEATURE / HIDIOCGFEATURE ioctl wrappers --
 //
@@ -355,23 +378,30 @@ fn encode_start_effect_page() -> [u8; FRAME_LEN] {
     f
 }
 
-/// Encodes the *select* frame that identifies the source key by its factory
-/// scancode.
-fn encode_select(scancode: u8) -> [u8; FRAME_LEN] {
-    let mut f = [0u8; FRAME_LEN];
-    f[REMAP_SELECT_OFFSET] = REMAP_MARKER;
-    f[REMAP_SELECT_OFFSET + 2] = scancode;
+/// `StartKeyDefPage`: announces the 9 key-definition packets that follow.
+fn encode_start_keydef_page() -> [u8; FRAME_LEN] {
+    let mut f = encode_cmd(CMD_WRITE_KEY_DEFINITION_AREA);
+    f[8] = KEY_DEF_PAGES as u8; // 0x09
     f
 }
 
-/// Encodes the *write* frame carrying the new 16-bit little-endian keycode.
-fn encode_remap_write(keycode: u16) -> [u8; FRAME_LEN] {
-    let [lo, hi] = keycode.to_le_bytes();
-    let mut f = [0u8; FRAME_LEN];
-    f[REMAP_WRITE_OFFSET] = REMAP_MARKER;
-    f[REMAP_WRITE_OFFSET + 2] = lo;
-    f[REMAP_WRITE_OFFSET + 3] = hi;
-    f
+/// Builds the 9-page key-definition buffer from `entries` (`key_index ->
+/// keycode`). Each entry is `[0x02, 0x00, kc_lo, kc_hi]` at offset
+/// `key_index * 4`; the last page carries the `AA 55` check code.
+fn encode_keydef_buffer(entries: &[(u8, u16)]) -> [u8; KEY_DEF_BUF_LEN] {
+    let mut buf = [0u8; KEY_DEF_BUF_LEN];
+    for &(ki, kc) in entries {
+        let o = ki as usize * 4;
+        if o + 3 < KEY_DEF_BUF_LEN {
+            let [lo, hi] = kc.to_le_bytes();
+            buf[o] = KEY_DEF_ENTRY_MARKER;
+            buf[o + 2] = lo;
+            buf[o + 3] = hi;
+        }
+    }
+    buf[KEY_DEF_BUF_LEN - 2] = FOOTER_MAGIC[0]; // page 8, byte 62
+    buf[KEY_DEF_BUF_LEN - 1] = FOOTER_MAGIC[1]; // page 8, byte 63
+    buf
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -461,15 +491,25 @@ impl EpomakerDriver {
         Ok(())
     }
 
-    /// Maps a matrix position to the source key's factory scancode used by
-    /// the select frame. Returns `None` for positions whose scancode is not
-    /// yet known (the slot→key map is partial — see docs).
-    fn scancode_for(&self, _layer: u8, row: u8, col: u8) -> Option<u8> {
-        // The reverse-engineering effort confirmed the keyboard addresses keys
-        // by their default scancode; the full (row,col)->scancode table is to
-        // be completed against hardware. Until then, a frontend may address by
-        // scancode directly by encoding it as col on row 0.
-        if row == 0 { Some(col) } else { None }
+    /// Sends the full key-definition (remap) transaction for `entries`
+    /// (`key_index -> keycode`): customization-on → start-keydef-page → 9 pages
+    /// → end → effect-start, each `Send` paced by a `Read` (§3.8).
+    async fn commit_keymap(&self, entries: &[(u8, u16)]) -> Result<(), DriverError> {
+        let buf = encode_keydef_buffer(entries);
+        self.io.set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION)).await?;
+        self.read_ack().await;
+        self.io.set_feature(encode_start_keydef_page()).await?;
+        self.read_ack().await;
+        for p in 0..KEY_DEF_PAGES {
+            let mut page = [0u8; FRAME_LEN];
+            page.copy_from_slice(&buf[p * FRAME_LEN..(p + 1) * FRAME_LEN]);
+            self.io.set_feature(page).await?;
+            self.read_ack().await;
+        }
+        self.io.set_feature(encode_cmd(CMD_COMMUNICATION_END)).await?;
+        self.read_ack().await;
+        self.io.set_feature(encode_cmd(CMD_LED_EFFECT_START)).await?;
+        Ok(())
     }
 }
 
@@ -525,28 +565,42 @@ impl KeyboardDriver for EpomakerDriver {
         Ok(self.lighting.to_bytes())
     }
 
-    /// Flushes pending keymap edits to the device as `select + write` frame
-    /// pairs, then clears the dirty set.
+    /// Flushes the keymap to the device's key-definition area (§3.8). Sends the
+    /// **full base-layer keymap** (not just the dirty set): zero entries keep the
+    /// factory default, so re-sending everything avoids resetting previously
+    /// remapped keys.
     async fn commit_to_nvram(&mut self) -> Result<(), DriverError> {
         if self.dirty.is_empty() {
             return Ok(());
         }
-        let pending: Vec<((u8, u8, u8), u16)> = self.dirty.iter().map(|(k, v)| (*k, *v)).collect();
-        for ((layer, row, col), keycode) in pending {
-            match self.scancode_for(layer, row, col) {
-                Some(scancode) => {
-                    self.io.set_feature(encode_select(scancode)).await?;
-                    self.io.set_feature(encode_remap_write(keycode)).await?;
-                }
-                None => {
-                    warn!(
-                        device_id = %self.device_id,
-                        layer, row, col,
-                        "skipping remap — no known scancode for matrix position (EK68 slot map incomplete)",
-                    );
-                }
+        let mut entries: Vec<(u8, u16)> = Vec::new();
+        let mut fn_layer_skips: u32 = 0;
+        for (&(layer, row, col), &keycode) in self.keymap.iter() {
+            if layer != 0 {
+                // Fn-layer placement in the key-def area is not yet decoded (§3.8).
+                fn_layer_skips += 1;
+                continue;
+            }
+            match key_index_for(row, col) {
+                Some(ki) => entries.push((ki, keycode)),
+                None => warn!(
+                    device_id = %self.device_id,
+                    row, col, "skipping remap — no key at matrix position",
+                ),
             }
         }
+        if fn_layer_skips > 0 {
+            warn!(
+                device_id = %self.device_id,
+                count = fn_layer_skips,
+                "EK68 Fn-layer edits not flushed — key-def placement for layer 1 is undecoded",
+            );
+        }
+        if entries.is_empty() {
+            self.dirty.clear();
+            return Ok(());
+        }
+        self.commit_keymap(&entries).await?;
         self.dirty.clear();
         Ok(())
     }
@@ -702,7 +756,7 @@ mod tests {
                 self.0.get_feature(r).await
             }
         }
-        EpomakerDriver::with_io(Box::new(Shim(io)), "ek68".into(), (5, 16), 2)
+        EpomakerDriver::with_io(Box::new(Shim(io)), "ek68".into(), (5, 15), 2)
     }
 
     #[test]
@@ -746,18 +800,28 @@ mod tests {
     }
 
     #[test]
-    fn remap_write_is_little_endian() {
-        let f = encode_remap_write(0x0004); // KC_A
-        assert_eq!(f[REMAP_WRITE_OFFSET], REMAP_MARKER);
-        assert_eq!(f[REMAP_WRITE_OFFSET + 2], 0x04);
-        assert_eq!(f[REMAP_WRITE_OFFSET + 3], 0x00);
+    fn key_index_for_maps_matrix() {
+        assert_eq!(key_index_for(0, 0), Some(1)); // Esc
+        assert_eq!(key_index_for(2, 7), Some(62)); // J
+        assert_eq!(key_index_for(4, 3), Some(94)); // Space
+        assert_eq!(key_index_for(4, 9), None); // empty cell
+        assert_eq!(key_index_for(0, 14), None); // empty cell
+        assert_eq!(key_index_for(9, 9), None); // out of bounds
     }
 
     #[test]
-    fn select_carries_scancode() {
-        let f = encode_select(0x29); // Esc
-        assert_eq!(f[REMAP_SELECT_OFFSET], REMAP_MARKER);
-        assert_eq!(f[REMAP_SELECT_OFFSET + 2], 0x29);
+    fn keydef_buffer_places_entry_at_index_times_4() {
+        // Esc (key_index 1) and Space (key_index 94) -> KC_A (little-endian).
+        let buf = encode_keydef_buffer(&[(1, 0x0004), (94, 0x0004)]);
+        assert_eq!(buf[1 * 4], KEY_DEF_ENTRY_MARKER);
+        assert_eq!(buf[1 * 4 + 2], 0x04);
+        assert_eq!(buf[1 * 4 + 3], 0x00);
+        assert_eq!(buf[94 * 4], KEY_DEF_ENTRY_MARKER);
+        assert_eq!(buf[94 * 4 + 2], 0x04);
+        // Check code lives on the last page (bytes 62/63 of page 8).
+        assert_eq!(buf[KEY_DEF_BUF_LEN - 2], FOOTER_MAGIC[0]);
+        assert_eq!(buf[KEY_DEF_BUF_LEN - 1], FOOTER_MAGIC[1]);
+        assert_eq!(buf.len(), 9 * FRAME_LEN);
     }
 
     #[tokio::test]
@@ -815,26 +879,51 @@ mod tests {
     async fn set_keycode_is_buffered_until_commit() {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
-        d.set_keycode(0, 0, 0x29, 0x0004).await.unwrap(); // row0,col=scancode Esc -> A
+        d.set_keycode(0, 0, 0, 0x0004).await.unwrap(); // Esc (key_index 1) -> A
         assert!(io.sent().is_empty(), "writes must not hit the wire before commit");
-        assert_eq!(d.get_keycode(0, 0, 0x29).await.unwrap(), 0x0004);
+        assert_eq!(d.get_keycode(0, 0, 0).await.unwrap(), 0x0004);
 
         d.commit_to_nvram().await.unwrap();
         let sent = io.sent();
-        assert_eq!(sent.len(), 2, "expected select + write");
-        assert_eq!(sent[0][REMAP_SELECT_OFFSET + 2], 0x29); // select Esc scancode
-        assert_eq!(sent[1][REMAP_WRITE_OFFSET + 2], 0x04); // write KC_A low byte
+        // transaction = 04 18, 04 11, 9 pages, 04 02, 04 f0 = 13 frames.
+        assert_eq!(sent.len(), 2 + KEY_DEF_PAGES + 2);
+        assert_eq!((sent[0][0], sent[0][1]), (PACKET_HEADER, CMD_TURN_ON_CUSTOMIZATION));
+        assert_eq!((sent[1][0], sent[1][1]), (PACKET_HEADER, CMD_WRITE_KEY_DEFINITION_AREA));
+        assert_eq!(sent[1][8], KEY_DEF_PAGES as u8);
+        // Esc entry at offset 4 lives in page 0 (frame index 2).
+        assert_eq!(sent[2][4], KEY_DEF_ENTRY_MARKER);
+        assert_eq!(sent[2][6], 0x04);
+        // Check code on the last page (frame index 2+8 = 10).
+        assert_eq!(sent[2 + KEY_DEF_PAGES - 1][62], 0xAA);
+        assert_eq!(sent[2 + KEY_DEF_PAGES - 1][63], 0x55);
+        // Trailer.
+        assert_eq!((sent[11][0], sent[11][1]), (PACKET_HEADER, CMD_COMMUNICATION_END));
+        assert_eq!((sent[12][0], sent[12][1]), (PACKET_HEADER, CMD_LED_EFFECT_START));
 
         // Buffer cleared — a second commit is a no-op.
         d.commit_to_nvram().await.unwrap();
-        assert_eq!(io.sent().len(), 2);
+        assert_eq!(io.sent().len(), 13);
     }
 
     #[tokio::test]
-    async fn commit_skips_unknown_positions() {
+    async fn commit_sends_full_keymap_not_just_dirty() {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
-        d.set_keycode(0, 3, 5, 0x0004).await.unwrap(); // row!=0 -> no known scancode
+        d.set_keycode(0, 0, 0, 0x0004).await.unwrap(); // Esc -> A
+        d.set_keycode(0, 2, 7, 0x0005).await.unwrap(); // J (key_index 62) -> B
+        d.commit_to_nvram().await.unwrap();
+        let sent = io.sent();
+        // page 0 has Esc; page for J (62*4=248 -> page 3, offset 56) has J.
+        assert_eq!(sent[2][4], KEY_DEF_ENTRY_MARKER); // Esc in page 0
+        assert_eq!(sent[2 + 3][56], KEY_DEF_ENTRY_MARKER); // J in page 3
+        assert_eq!(sent[2 + 3][58], 0x05); // KC_B low byte
+    }
+
+    #[tokio::test]
+    async fn commit_skips_when_only_unknown_positions() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        d.set_keycode(0, 4, 9, 0x0004).await.unwrap(); // empty matrix cell
         d.commit_to_nvram().await.unwrap();
         assert!(io.sent().is_empty());
     }
@@ -843,7 +932,7 @@ mod tests {
     async fn commit_propagates_transport_failure() {
         let io = Arc::new(MockIo::failing());
         let mut d = driver_with(io.clone());
-        d.set_keycode(0, 0, 0x29, 0x0004).await.unwrap();
+        d.set_keycode(0, 0, 0, 0x0004).await.unwrap(); // Esc -> A (known position)
         assert!(matches!(d.commit_to_nvram().await, Err(DriverError::Disconnected)));
     }
 

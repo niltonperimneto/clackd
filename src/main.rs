@@ -311,12 +311,13 @@ fn via_fallback_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, D
     Ok(driver)
 }
 
-/// EK68 matrix bounds and layer count for the Epomaker driver. Topology is
-/// taken from the firmware-identical GMK67 LED matrix (16 wide × 5 high →
-/// 5 rows × 16 cols; see docs/protocol/epomaker-ek68.md §3.6); the device
-/// offers no topology query. Two layers (base + Fn) per the approved plan; the
-/// keymap matrix may differ from the LED matrix and is confirmed on hardware.
-const EK68_MATRIX: (u8, u8) = (5, 16);
+/// EK68 matrix bounds and layer count for the Epomaker driver. The keymap
+/// matrix (5 rows × 15 cols) comes from the vendor `KeyboardLayout.xml` key
+/// positions (docs/protocol/epomaker-ek68.md §3.7); the driver's `KEY_INDEX`
+/// table maps each `(row, col)` to the firmware `key_index`. Two layers
+/// (base + Fn) per the approved plan; only base-layer remap is wired so far
+/// (§3.8). The device offers no topology query.
+const EK68_MATRIX: (u8, u8) = (5, 15);
 const EK68_LAYERS: u8 = 2;
 
 /// Factory for the Epomaker EK68 (non-VIA) vendor driver.
