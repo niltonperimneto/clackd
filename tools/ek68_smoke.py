@@ -265,22 +265,27 @@ def direct_demo(h, seconds=6.0):
     print("If the keys were green and stayed green, Direct mode + keepalive work.")
 
 
-def remap_experiment(h, key_name="J", fn_layer=False):
+def remap_experiment(h, key_name="J", fn_layer=False, target="A"):
     layer = "Fn layer" if fn_layer else "base layer"
     command = WRITE_KEY_DEFINITION_AREA_FN_COMMAND if fn_layer else WRITE_KEY_DEFINITION_AREA_COMMAND
     press = f"Fn+'{key_name}'" if fn_layer else f"'{key_name}'"
-    print(f"\nREMAP EXPERIMENT ({layer}) -- this WRITES THE EEPROM (a few cycles). "
-          f"We remap {press} -> A via the key-definition area (section 5), "
-          "you test it, then we restore it.\n")
     if key_name not in KEYS:
         sys.exit(f"unknown key '{key_name}'. Known: {', '.join(KEYS)}")
+    if target not in KEYS:
+        sys.exit(f"unknown target '{target}'. Known: {', '.join(KEYS)}")
     code, index = KEYS[key_name]
-    KC_A = 0x04
+    target_code = KEYS[target][0]  # basic VIA keycode == HID code
+    if key_name == target:
+        print("  NOTE: source and target are the same key -- you won't see a "
+              "change. Pass a different --to KEY.")
 
-    print(f"  Writing {press} (key_index {index}, offset {index*4}) -> KC_A "
-          f"via command 0x{command:02x} ...")
-    keydef_commit(h, {index: KC_A}, command)
-    input(f"  Open a text box and press {press}. Did it type 'A'?  "
+    print(f"\nREMAP EXPERIMENT ({layer}) -- this WRITES THE EEPROM (a few cycles). "
+          f"We remap {press} -> '{target}' via the key-definition area (section 5), "
+          "you test it, then we restore it.\n")
+    print(f"  Writing {press} (key_index {index}, offset {index*4}) -> '{target}' "
+          f"(0x{target_code:02x}) via command 0x{command:02x} ...")
+    keydef_commit(h, {index: target_code}, command)
+    input(f"  Open a text box and press {press}. Did it type '{target}'?  "
           "[press Enter to restore] ")
 
     if fn_layer:
@@ -307,6 +312,8 @@ def main():
                     help="remap KEY (default J) -> A via the key-definition area, then restore (writes EEPROM)")
     ap.add_argument("--fn", action="store_true",
                     help="with --remap, target the Fn layer (command 0x27) instead of the base layer")
+    ap.add_argument("--to", metavar="KEY", default="A",
+                    help="with --remap, the key to remap TO (default A); pick a different key to see the change")
     args = ap.parse_args()
 
     if args.list:
@@ -322,7 +329,7 @@ def main():
         elif not args.remap:
             lighting_demo(h)
         if args.remap:
-            remap_experiment(h, args.remap, fn_layer=args.fn)
+            remap_experiment(h, args.remap, fn_layer=args.fn, target=args.to)
     finally:
         h.close()
 
