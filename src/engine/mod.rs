@@ -288,6 +288,9 @@ pub(crate) struct DeviceHandle {
     /// session per the cache-once-on-attach pattern documented on
     /// [`crate::hal::KeyboardDriver::get_matrix_dimensions`].
     topology: DeviceTopology,
+    /// Human-readable model name from the driver, cached at attach time
+    /// alongside the topology (see [`crate::hal::KeyboardDriver::model_name`]).
+    model: String,
     /// Bounded sender into the worker's command loop.
     tx: mpsc::Sender<WorkerOp>,
     vendor_id: u16,
@@ -527,6 +530,7 @@ async fn handle_command(
         EngineCommand::GetDeviceInfo { device_id, reply } => {
             let result = match registry.devices.get(&device_id) {
                 Some(handle) => Ok((
+                    handle.model.clone(),
                     handle.topology.matrix.rows,
                     handle.topology.matrix.cols,
                     handle.topology.layer_count,
@@ -763,10 +767,12 @@ async fn attach_device(
         matrix: topology::KeyMatrix { rows, cols },
         layer_count,
     };
+    // Capture the model name before the driver is moved into the worker.
+    let model = driver.model_name().to_owned();
 
     let (tx, rx) = mpsc::channel(WORKER_CHANNEL_CAPACITY);
     tokio::spawn(run_device_worker(device_id, driver, rx, engine_tx, lifecycle_tx));
-    Ok(DeviceHandle { topology, tx, vendor_id, product_id, hidraw_path })
+    Ok(DeviceHandle { topology, model, tx, vendor_id, product_id, hidraw_path })
 }
 
 /// Per-device worker loop.
@@ -1041,6 +1047,7 @@ mod tests {
 
         registry.devices.insert("dev1".into(), DeviceHandle {
             topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            model: "test_model".to_string(),
             tx: worker_tx, vendor_id: 0, product_id: 0, hidraw_path: PathBuf::new(),
         });
 
@@ -1061,6 +1068,7 @@ mod tests {
 
         registry.devices.insert("dev1".into(), DeviceHandle {
             topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            model: "test_model".to_string(),
             tx: worker_tx, vendor_id: 0, product_id: 0, hidraw_path: PathBuf::new(),
         });
 

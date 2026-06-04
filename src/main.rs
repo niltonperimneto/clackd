@@ -46,7 +46,7 @@ use engine::messages::EngineCommand;
 use engine::{
     DaemonError, DriverTable, LifecycleEvent, ENGINE_CHANNEL_CAPACITY, LIFECYCLE_CHANNEL_CAPACITY,
 };
-use hal::epomaker::EpomakerDriver;
+use hal::gmk67::Gmk67Driver;
 use hal::via::ViaDriver;
 use hal::KeyboardDriver;
 
@@ -172,7 +172,7 @@ struct DeviceConfig {
     /// If set, overrides the layer count queried from firmware.
     #[allow(dead_code)]
     layer_count_override: Option<u8>,
-    /// Driver backend for this device: `"via"` (default) or `"epomaker"`.
+    /// Driver backend for this device: `"via"` (default) or `"gmk67"`.
     /// Selects the vendor HAL driver in [`build_driver_table`].
     #[serde(default)]
     driver: Option<String>,
@@ -218,7 +218,11 @@ fn build_driver_table() -> DriverTable {
                             // back to VIA with a warning rather than dropping
                             // the device entirely.
                             let factory: engine::DriverFactory = match backend {
-                                "epomaker" => epomaker_factory,
+                                "gmk67" => gmk67_factory,
+                                "epomaker" => {
+                                    warn!("driver = \"epomaker\" is deprecated; rename it to \"gmk67\" in devices.toml");
+                                    gmk67_factory
+                                }
                                 "via" => via_fallback_factory,
                                 other => {
                                     warn!(driver = other, "unknown driver backend — defaulting to via");
@@ -311,7 +315,7 @@ fn via_fallback_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, D
     Ok(driver)
 }
 
-/// EK68 matrix bounds and layer count for the Epomaker driver. The keymap
+/// EK68 matrix bounds and layer count for the GMK67-family driver. The keymap
 /// matrix (5 rows × 15 cols) comes from the vendor `KeyboardLayout.xml` key
 /// positions (docs/protocol/epomaker-ek68.md section 6); the driver's `KEY_INDEX`
 /// table maps each `(row, col)` to the firmware `key_index`. Two layers
@@ -320,14 +324,15 @@ fn via_fallback_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, D
 const EK68_MATRIX: (u8, u8) = (5, 15);
 const EK68_LAYERS: u8 = 2;
 
-/// Factory for the Epomaker EK68 (non-VIA) vendor driver.
+/// Factory for the GMK67-family (non-VIA) vendor driver (Epomaker EK68 /
+/// Zuoya GMK67).
 ///
 /// **Context:** Selected for a `(vid, pid)` whose `devices.toml` entry sets
-/// `driver = "epomaker"`. Binds the vendor Feature-report interface (the
-/// `EpomakerDriver::new` probe rejects the non-vendor hidraw node of the
+/// `driver = "gmk67"`. Binds the vendor Feature-report interface (the
+/// `Gmk67Driver::new` probe rejects the non-vendor hidraw node of the
 /// composite device).
-fn epomaker_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
-    Ok(Box::new(EpomakerDriver::new(hidraw_path, EK68_MATRIX, EK68_LAYERS)?))
+fn gmk67_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
+    Ok(Box::new(Gmk67Driver::new(hidraw_path, EK68_MATRIX, EK68_LAYERS)?))
 }
 
 /// Emits `READY=1` to the systemd notification socket.

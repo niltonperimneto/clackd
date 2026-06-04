@@ -136,7 +136,7 @@ impl ClackdInterface {
     /// # Errors
     /// - `UnknownObject` if no device is registered under `device_id`.
     /// - `Failed` for engine-channel failures.
-    async fn get_device_info(&self, device_id: &str) -> zbus::fdo::Result<(u8, u8, u8)> {
+    async fn get_device_info(&self, device_id: &str) -> zbus::fdo::Result<(String, u8, u8, u8)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.engine_tx
             .send(EngineCommand::GetDeviceInfo {

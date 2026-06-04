@@ -63,7 +63,7 @@ LIGHTS_OFF_MODE_VALUE = 0x80
 
 BRIGHTNESS_MAX = 0x0F  # app "15"; range 0x00..0x0F
 
-# ---- frame encoders (mirror src/hal/epomaker.rs) ----------------------------
+# ---- frame encoders (mirror src/hal/gmk67.rs) ----------------------------
 
 
 def cmd_frame(command, extra=None):

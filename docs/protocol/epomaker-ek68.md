@@ -1,9 +1,11 @@
 # Epomaker EK68 HID protocol
 
 Reverse-engineered specification for the Epomaker EK68 keyboard's proprietary
-configuration protocol, as implemented by the clackd `epomaker` driver
-([`src/hal/epomaker.rs`](../../src/hal/epomaker.rs), selected with
-`driver = "epomaker"` in `devices.toml`).
+configuration protocol, as implemented by the clackd `gmk67` driver
+([`src/hal/gmk67.rs`](../../src/hal/gmk67.rs), selected with
+`driver = "gmk67"` in `devices.toml`). The driver is named for the shared
+`hfd.cn` "GMK67" protocol rather than a single board, since the Epomaker EK68
+and Zuoya GMK67 are firmware-identical rebadges that both speak it.
 
 The EK68 is firmware-identical to the Zuoya GMK67: identical USB identity and
 report format. The protocol below was decoded from the GMK67 OpenRGB driver and
@@ -297,14 +299,14 @@ Entries below are `key (code / index)`, grouped by physical row:
 | Addressing | Flat `key_index` (1–121); `(row, col)` is a clackd convenience layer |
 
 The driver's `KEY_INDEX` table in
-[`src/hal/epomaker.rs`](../../src/hal/epomaker.rs) maps each `(row, col)` to a
+[`src/hal/gmk67.rs`](../../src/hal/gmk67.rs) maps each `(row, col)` to a
 `key_index`.
 
 ---
 
 ## 8. Driver implementation notes
 
-`src/hal/epomaker.rs`:
+`src/hal/gmk67.rs`:
 
 - **Lighting** — `set_lighting` runs the static/effect transaction (section 4.3).
   Brightness and speed are clamped to `0x00`–`0x0F`. Per-key Direct/Custom is not

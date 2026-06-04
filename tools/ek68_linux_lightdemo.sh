@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # EK68 lighting demo driven through the running clackd daemon via clackctl.
-# Confirms the Epomaker driver end-to-end (D-Bus -> engine -> hal::epomaker
+# Confirms the GMK67-family driver end-to-end (D-Bus -> engine -> hal::gmk67
 # -> HIDIOCSFEATURE). Lighting is volatile (no EEPROM writes).
 #
 # Prereqs: clackd running on the session bus, EK68 attached (see clackctl list).
