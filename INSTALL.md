@@ -56,6 +56,27 @@ sudo install -Dm644 dist/udev/60-clackd-via.rules   /etc/udev/rules.d/60-clackd-
 # Adjust the ExecStart= path in the unit file if you used ~/.local/bin.
 ```
 
+## Installing with Meson (Alternative)
+
+Alternatively, you can build and install the daemon, CLI, and configuration files using the Meson build system:
+
+```sh
+# Setup the build directory
+meson setup build
+
+# Compile the binaries (respects --buildtype release or debug)
+meson compile -C build
+
+# Run unit tests via Cargo under Meson
+meson test -C build
+
+# Install files system-wide (requires root for udev/dbus/systemd installation)
+sudo meson install -C build
+```
+
+This compiles the Rust binaries via `cargo`, configures and installs the systemd user service, the D-Bus session activation service, and the udev rules to their standard system directories. You can customize installation paths using standard meson options or custom ones like `-Dudev-dir=/usr/lib/udev`.
+
+
 ## Activate
 
 After install, reload the daemon-side machinery:
@@ -109,6 +130,33 @@ pid = 0xeed3
 rows = 5
 cols = 15
 # layer_count_override = 4  # optional; overrides firmware report
+```
+
+### Non-VIA vendor drivers (GMK67 family — Epomaker EK68 / Zuoya GMK67)
+
+Devices that don't speak VIA use a vendor backend, selected with `driver`. The
+`gmk67` backend speaks the shared `hfd.cn` "GMK67" protocol used by several
+firmware-identical boards — the Epomaker EK68 and the Zuoya GMK67 both report
+USB `05ac:024f` and are driven over its 64-byte HID Feature report:
+
+```toml
+[[device]]
+vid = 0x05ac
+pid = 0x024f
+rows = 5
+cols = 15
+driver = "gmk67"
+```
+
+> The backend was previously named `"epomaker"`; that value still works but is
+> deprecated and logs a warning. Update existing configs to `"gmk67"`.
+
+`driver` defaults to `"via"` when omitted. RGB lighting (mode/colour/brightness)
+is fully supported; key remapping is shadow-state with a vendor-blob commit (see
+`docs/protocol/epomaker-ek68.md`). The matching udev line:
+
+```
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="024f", TAG+="uaccess"
 ```
 
 ### Write-coalescing buffer

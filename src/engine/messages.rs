@@ -169,16 +169,16 @@ pub(crate) enum EngineCommand {
         reply: oneshot::Sender<Vec<String>>,
     },
 
-    /// Fetch the cached `(rows, cols, layer_count)` topology for a device.
+    /// Fetch the cached `(model, rows, cols, layer_count)` metadata for a device.
     ///
-    /// **Context:** Topology is cached on the registry entry at attach time
-    /// (the cache-once-on-attach pattern), so this is answered without a
-    /// hardware round-trip. Drives `clackctl info`.
+    /// **Context:** Both the model name and the topology are cached on the
+    /// registry entry at attach time (the cache-once-on-attach pattern), so
+    /// this is answered without a hardware round-trip. Drives `clackctl info`.
     GetDeviceInfo {
         /// Stable engine-side identifier for the target device.
         device_id: String,
-        /// Reply channel; `(rows, cols, layer_count)` on success.
-        reply: oneshot::Sender<Result<(u8, u8, u8), DaemonError>>,
+        /// Reply channel; `(model, rows, cols, layer_count)` on success.
+        reply: oneshot::Sender<Result<(String, u8, u8, u8), DaemonError>>,
     },
 
     /// Force a commit / NVRAM flush for a device.

@@ -62,6 +62,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use thiserror::Error;
 
+pub mod gmk67;
 pub mod via;
 
 /// Errors raised by [`KeyboardDriver`] implementations.
@@ -332,5 +333,17 @@ pub trait KeyboardDriver: Send + Sync {
     /// all unbuffered backends.
     fn emits_layout_event_per_set(&self) -> bool {
         true
+    }
+
+    /// Human-readable model name for display in clients (e.g. `clackctl
+    /// list` / `info`).
+    ///
+    /// **Context:** Read once at attach time and cached on the registry
+    /// entry alongside topology (the cache-once-on-attach pattern); it does
+    /// not touch hardware. Vendor backends override this with a recognizable
+    /// product name. The default is a generic label, since authentic VIA
+    /// firmware exposes no host-side model string over the raw-HID protocol.
+    fn model_name(&self) -> &str {
+        "VIA keyboard"
     }
 }

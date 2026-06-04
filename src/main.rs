@@ -46,6 +46,7 @@ use engine::messages::EngineCommand;
 use engine::{
     DaemonError, DriverTable, LifecycleEvent, ENGINE_CHANNEL_CAPACITY, LIFECYCLE_CHANNEL_CAPACITY,
 };
+use hal::gmk67::Gmk67Driver;
 use hal::via::ViaDriver;
 use hal::KeyboardDriver;
 
@@ -171,6 +172,10 @@ struct DeviceConfig {
     /// If set, overrides the layer count queried from firmware.
     #[allow(dead_code)]
     layer_count_override: Option<u8>,
+    /// Driver backend for this device: `"via"` (default) or `"gmk67"`.
+    /// Selects the vendor HAL driver in [`build_driver_table`].
+    #[serde(default)]
+    driver: Option<String>,
 }
 
 /// Top-level structure for `$XDG_CONFIG_HOME/clackd/devices.toml`.
@@ -200,18 +205,31 @@ fn build_driver_table() -> DriverTable {
                 match toml::from_str::<DevicesConfig>(&contents) {
                     Ok(cfg) => {
                         for dev in &cfg.device {
+                            let backend = dev.driver.as_deref().unwrap_or("via");
                             info!(
                                 vid = format!("{:04x}", dev.vid),
                                 pid = format!("{:04x}", dev.pid),
                                 rows = dev.rows,
                                 cols = dev.cols,
+                                driver = backend,
                                 "registered device from config",
                             );
-                            // For known devices we still use the VIA fallback
-                            // factory since VIA is the only driver in Mission 3.
-                            // The matrix dimensions are stored in DriverTable
-                            // by_vid_pid entries which the supervisor will use.
-                            by_vid_pid.insert((dev.vid, dev.pid), via_fallback_factory as engine::DriverFactory);
+                            // Select the vendor backend. Unknown values fall
+                            // back to VIA with a warning rather than dropping
+                            // the device entirely.
+                            let factory: engine::DriverFactory = match backend {
+                                "gmk67" => gmk67_factory,
+                                "epomaker" => {
+                                    warn!("driver = \"epomaker\" is deprecated; rename it to \"gmk67\" in devices.toml");
+                                    gmk67_factory
+                                }
+                                "via" => via_fallback_factory,
+                                other => {
+                                    warn!(driver = other, "unknown driver backend — defaulting to via");
+                                    via_fallback_factory
+                                }
+                            };
+                            by_vid_pid.insert((dev.vid, dev.pid), factory);
                         }
                     }
                     Err(e) => {
@@ -295,6 +313,26 @@ fn via_fallback_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, D
         None => Box::new(ViaDriver::new(hidraw_path, (16, 16))?),
     };
     Ok(driver)
+}
+
+/// EK68 matrix bounds and layer count for the GMK67-family driver. The keymap
+/// matrix (5 rows × 15 cols) comes from the vendor `KeyboardLayout.xml` key
+/// positions (docs/protocol/epomaker-ek68.md section 6); the driver's `KEY_INDEX`
+/// table maps each `(row, col)` to the firmware `key_index`. Two layers
+/// (base + Fn) per the approved plan; only base-layer remap is wired so far
+/// (doc section 5). The device offers no topology query.
+const EK68_MATRIX: (u8, u8) = (5, 15);
+const EK68_LAYERS: u8 = 2;
+
+/// Factory for the GMK67-family (non-VIA) vendor driver (Epomaker EK68 /
+/// Zuoya GMK67).
+///
+/// **Context:** Selected for a `(vid, pid)` whose `devices.toml` entry sets
+/// `driver = "gmk67"`. Binds the vendor Feature-report interface (the
+/// `Gmk67Driver::new` probe rejects the non-vendor hidraw node of the
+/// composite device).
+fn gmk67_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
+    Ok(Box::new(Gmk67Driver::new(hidraw_path, EK68_MATRIX, EK68_LAYERS)?))
 }
 
 /// Emits `READY=1` to the systemd notification socket.
