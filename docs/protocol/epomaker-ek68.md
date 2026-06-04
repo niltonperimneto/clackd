@@ -1,15 +1,33 @@
 # Epomaker EK68 (non-VIA) — proprietary HID protocol
 
 > **Driver:** implemented in `src/hal/epomaker.rs` (registered via
-> `driver = "epomaker"` in `devices.toml`). Lighting is fully wired; keymap is
-> shadow-state + select/write commit pending hardware confirmation of the
-> write offset; macros are shadow-only (format not yet decoded).
+> `driver = "epomaker"` in `devices.toml`). Transport + connect handshake are
+> confirmed on hardware.
 >
-> **Status: IN PROGRESS — reverse engineering.**
-> This is a living document. Fields marked `TODO` are unconfirmed and must be
-> filled from Wireshark/USBPcap captures (wired USB) of the official Epomaker
-> Windows driver before the clackd `epomaker` HAL driver implements them.
-> **Do not implement anything in `src/hal/epomaker.rs` against a `TODO` here.**
+> ## ⚡ BREAKTHROUGH (2026-06-04): the EK68 *is* a GMK67 — lighting protocol fully decoded
+>
+> The EK68 shares its exact USB identity (`05AC:024F`, interface 0, usage
+> `0001:0006`) and firmware with the **Zuoya GMK67**, which was already
+> reverse-engineered for OpenRGB by Aubry Flora ("aethernali.live"). See
+> **§3.6** for the complete decoded protocol ported from that source.
+>
+> **Why our lighting never rendered:** the render is a *multi-frame transaction*,
+> not a single frame. We were sending only the middle `01 R G B … AA 55` frame.
+> The frames we had dismissed as "heartbeats" (`04 18`, `04 13 …`, `04 02`,
+> `04 f0`) are in fact the **mandatory transaction framing** (`PACKET_HEADER`
+> = `0x04`): turn-on-customization → start-effect-page → [mode frame] →
+> end-communication → start-effect-command. Omitting that wrapper is exactly why
+> even byte-exact replay failed (§3.5). The per-key framebuffer seen on `GET` is
+> the `Direct`/`Custom` mode buffer (`index,R,G,B` × 128), written by a *separate*
+> `0x20`/`0x23` command. Lighting is no longer blocked.
+>
+> **Status: lighting protocol CONFIRMED ON HARDWARE (2026-06-04).** The full
+> UpdateMode transaction renders static colours, brightness, and effects from
+> our own process via `tools/ek68_smoke.py`; mirrored in `src/hal/epomaker.rs`.
+> Keymap is shadow-state + select/write commit pending hardware confirmation of
+> the write offset; macros are shadow-only (the GMK67 source exposes the
+> `WRITE_MACRO_DEFINITION_AREA_COMMAND = 0x15` / `READ … = 0x14` area — a lead).
+> This is a living document. Fields still marked `TODO` are unconfirmed.
 
 ## Scope
 
@@ -122,6 +140,12 @@ One row per discovered command. Capture **one variable per capture** and diff.
 
 ### 3.0 Enter-PC-lighting-mode handshake (confirmed on hardware)
 
+> **SUPERSEDED by §3.6.** The "INIT_A/INIT_B" frames below were a partial,
+> mis-decoded view of the real transaction framing (`PACKET_HEADER = 0x04`:
+> `04 18` = customization-on, `04 13` = start-effect-page, `04 02` =
+> end-communication, `04 f0` = start-effect). The real "enter PC mode" is
+> `SetCustomization(ON)` *inside* each render transaction. Kept here for history.
+
 The board **stores** host lighting frames (they read back via `GET_REPORT`) but
 keeps **rendering its onboard effect** until the app's one-time connect sequence
 runs. Captured host→device (`SET_REPORT`) in the first second after the Windows
@@ -146,12 +170,17 @@ before the first lighting write (`pc_mode_handshake()` in `src/hal/epomaker.rs`)
 Lighting frame (64-byte payload):
 ```
 byte 0    effect/mode ID (table below)
-byte 1-3  R, G, B (single-color modes)
-byte 8    rainbow/multicolor flag (01 on Colourful/Spectrum)
-byte 9    brightness 0x01..0x10
-byte 10   0x0B when lit, 0x01 when off
-byte 14-15 AA 55 footer
+byte 1-3  R, G, B (mode-specific color; only if MODE_FLAG_HAS_MODE_SPECIFIC_COLOR)
+byte 8    random-color flag (1 = MODE_COLORS_RANDOM)
+byte 9    brightness 0x00..0x0F   (CORRECTED — app "15" = 0x0F; not 0x01..0x10)
+byte 10   speed      0x00..0x0F   (was mislabeled "0x0B const")
+byte 11   direction               (per-mode: LR / UD)
+byte 14-15 AA 55  = EFFECT_PAGE_CHECK_CODE_L / _H
 ```
+> **NOTE:** This frame is only the *middle* of the render transaction and does
+> nothing on its own — it must be wrapped by the `0x04`-header framing. The
+> authoritative, confirmed spec (constants, mode IDs, full send sequence, LED
+> map) is **§3.6**, decoded from the GMK67 ≡ EK68 OpenRGB source.
 
 | Mode | ID | Mode | ID | Mode | ID | Mode | ID |
 |---|---|---|---|---|---|---|---|
@@ -305,16 +334,223 @@ find the activation frame. Also capture two **custom** colors with different byt
 is known, the driver sends it on attach (and likely a periodic `04 xx` keepalive to hold
 software mode).
 
+### 3.5 Hardware deep-dive (Windows, direct HID via hidapi — 2026-06-04)
+
+Drove the EK68 directly (Python `hid`, interface 0 = the 64-byte Feature collection),
+Epomaker app closed unless noted. This refines §3.4 and **invalidates the simple
+handshake hypothesis**:
+
+- Writes reach the device. `GET_FEATURE` works, and the handshake visibly perturbs the
+  LEDs, so `SET_FEATURE` is delivered, not silently dropped by Windows.
+- Static `01 R G B ...` does not render from us. With no handshake the keyboard ignores
+  host config entirely (even an LED-off frame leaves the onboard colour on). The handshake
+  changes state (flicker/blank) but our `01` colour still does not render after it.
+- Byte-exact replay fails. Replaying the app's EXACT recorded 502 SET frames from
+  `ek68-connect.pcapng` only flickered (stayed on the prior colour). Replaying the FULL
+  recorded choreography (2705 ops = 502 SET + 2203 GET, in capture order) drove the LEDs
+  off, never the captured colour. Identical bytes + identical read pattern, writes
+  landing, yet no reproduction.
+- While lit, `GET_FEATURE` returns a paged per-key buffer (`<idx> R G B` groups, 16 per
+  64-byte page; successive GETs walk index ranges 0x10-0x1f, 0x20-0x2f, 0x40-0x4f ...).
+  The app issues ~4x more GET than SET (2203 vs 502), continuously reading these pages.
+
+**Conclusion:** the live-render path is NOT the static `01` command (it can't be
+reproduced even by byte-exact replay). It is therefore either stateful (a live value the
+keyboard returns via GET that must be folded into subsequent writes, so a recorded replay
+can never satisfy it), or the app renders via per-key framebuffer writes never captured
+(all prior captures set static colours, not custom per-key).
+
+**To resolve (next session):** (a) admin tshark (USBPcap) capture of the app setting
+custom per-key colours, to decode the per-key framebuffer write; and/or (b) capture and
+inspect the GET response payloads live for a changing nonce. Until then live RGB via
+clackd is blocked. Transport, the connect handshake, and the keymap path are unaffected.
+
+## 3.5 Windows direct-HID reproduction attempts (2026-06-04) — render NOT reproducible
+
+Tested directly against the keyboard from Windows via Python `hidapi` on interface 0
+(`MI_00`, the keyboard collection that carries the 64-byte Feature report). The connect
+handshake was captured and is now implemented, **but lighting still does not render from
+our process**, and the cause is deeper than a missing handshake:
+
+- ✅ **Writes reach the device.** `GET`/`SET_FEATURE` both work; sending the handshake
+  visibly changes the lighting (flicker / off), so Windows is **not** silently dropping
+  our writes.
+- ❌ **No frame sequence we send renders a colour.** All of the following were tried with
+  the app closed, and **none** reproduced the colour (results: ignored / flicker / off):
+  1. static `01 R G B` once; 2. static streamed continuously; 3. handshake + continuous
+  colour + heartbeats ("app-mimic"); 4. handshake + SET+GET polling; 5. **verbatim replay
+  of the app's exact 502 recorded SET frames**; 6. **full 2705-op SET+GET choreography
+  replay** (every SET and GET in original order).
+- ➡️ **Byte-exact replay fails.** Since replaying the app's own recorded frames does not
+  reproduce its result, the live-render path is **stateful** (a value the keyboard hands
+  the host live that must be folded into writes — un-replayable from a capture) **or**
+  uses a per-key framebuffer write we never captured, **or** depends on a Windows
+  HID-access nuance (handle mode/timing) the `hidapi` path doesn't reproduce.
+- 🔎 **Per-key framebuffer exists.** While a colour is active, `GET_FEATURE` returns a
+  **paged per-key buffer**: 4-byte entries `〈index〉〈R〉〈G〉〈B〉`, 16 per 64-byte page,
+  consecutive GETs returning index ranges (`0x10–0x1f`, `0x20–0x2f`, `0x40–0x4f`, …).
+  Showing red ⇒ entries like `10 5f 00 00 … 14 fd 00 00` (R only). **This is the likely
+  real render path**; the connect captures contain **no** per-key writes (they only set
+  *static* `01` colours), so the per-key **write** protocol is still uncaptured.
+- ℹ️ The earlier "read-back of our writes" / "byte 3 = ff anomaly" is explained: `GET`
+  returns this **per-key buffer**, not the last static frame we wrote — so it was never a
+  faithful read-back of our static command.
+- ℹ️ `usb.capdata` is empty in the captures, so GET **responses** weren't recorded by
+  USBPcap; can't check for a nonce from file (the live GET looked like per-key state).
+
+**Status:** ~~live RGB via clackd is **paused**~~ — **RESOLVED in §3.6.** The
+"stateful / uncaptured per-key write" hypothesis was half right: rendering is a
+**stateful multi-frame transaction**, and we were sending only the bare mode
+frame. The "heartbeats" we ignored (`04 …`) were the transaction framing. The
+per-key buffer seen on `GET` is the `Direct`/`Custom` framebuffer. Decoded in
+full below from the GMK67 ≡ EK68 OpenRGB source — no further captures needed.
+
+---
+
+## 3.6 RESOLVED — EK68 ≡ Zuoya GMK67: authoritative lighting protocol
+
+> ✅ **Verified on hardware 2026-06-04:** `tools/ek68_smoke.py` rendered
+> red/green/blue, brightness, spectrum, and off exactly as labelled — the
+> single-frame approach never did. Root cause was the missing transaction
+> framing documented below.
+
+
+### Identity (confirmed)
+The EK68 runs the **Zuoya GMK67** firmware. Identical USB identity: VID `0x05AC`,
+PID `0x024F`, **interface 0**, usage_page `0x0001`, usage `0x06`; 64-byte feature
+reports, report ID `0x00`, no checksum, `AA 55` page-check footer. Vendor string
+"ZUOYA".
+
+**Source:** OpenRGB device-support request #4512, implemented in Aubry Flora's
+fork `gitlab.com/aethernali.live/OpenRGB`, branch **`gmk67`** (HEAD
+`310cf818537e958c54572939ca6c4c5e624404cf`, 2024-07-20),
+`Controllers/GMK67KeyboardController/` (GPL-2.0). Mirrored as OpenRGB issue
+[#4512](https://gitlab.com/CalcProgrammer1/OpenRGB/-/work_items/4512).
+
+### Constants (`GMK67KeyboardController.h`)
+```
+REPORT_ID                   0x00
+PACKET_DATA_LENGTH          64      (HID buffer = REPORT_ID + 64 payload = 65 bytes)
+COLOR_BUF_SIZE              512     (= 8 packets × 64 = 128 LED slots × 4 bytes)
+EFFECT_PAGE_LENGTH          16
+LED_SPECIAL_EFFECT_PACKETS  0x01
+PACKET_HEADER               0x04    ← the "heartbeat" byte WAS the framing header
+EFFECT_PAGE_CHECK_CODE_L/H  0xAA / 0x55
+brightness / speed range    0x00 .. 0x0F   (app "15" = 0x0F)
+```
+
+Command IDs (byte 1, when byte 0 = `PACKET_HEADER` 0x04):
+
+| Hex | Name | Hex | Name |
+|---|---|---|---|
+| `0x02` | COMMUNICATION_END | `0x13` | WRITE_LED_SPECIAL_EFFECT_AREA |
+| `0x05` | GET_BASIC_INFO | `0x14`/`0x15` | READ/WRITE_MACRO_DEFINITION_AREA |
+| `0x10`/`0x11` | READ/WRITE_KEY_DEFINITION_AREA | `0x16`/`0x17` | READ/WRITE_GAME_MODE_AREA |
+| `0x12` | READ_LED_EFFECT_DEFINITION_AREA | `0x18`/`0x19` | TURN_ON/OFF_CUSTOMIZATION |
+| `0xF0` | LED_EFFECT_START | `0xF1/F2/F3` | LED_SYNC_INITIAL/START/STOP |
+| `0xAB` | RANDOM_PACKET_START | | |
+
+### Mode IDs (byte 0 of the mode frame) — supersedes the old §3.1 table
+`0x01` Static · `0x02` Keystroke light-up · `0x03` Keystroke dim · `0x04` Sparkle ·
+`0x05` Rain · `0x06` Random colors · `0x07` Breathing · `0x08` Spectrum cycle ·
+`0x09` Ring gradient · `0x0A` Vertical gradient · `0x0B` Horizontal gradient /
+Rainbow wave · `0x0C` Around edges · `0x0D` Keystroke horizontal lines · `0x0E`
+Keystroke tilted lines · `0x0F` Keystroke ripples · `0x10` Sequence · `0x11` Wave
+line · `0x12` Tilted lines · `0x13` Back-and-forth.
+Special modes: `0x20` **DIRECT** (per-key, volatile), `0x23` **CUSTOM** (per-key,
+saved), `0x80` **LIGHTS-OFF**.
+
+`HAS_MODE_SPECIFIC_COLOR` modes use bytes 1–3 for RGB; `Random colors`, `Spectrum
+cycle`, and `Off` carry no color. `HAS_DIRECTION` only on the gradient/sequence/
+back-and-forth modes (byte 11).
+
+### The render transactions
+Helpers: **`Send(buf)`** = `SET_FEATURE` of `[0x00, buf(64)]` (65 bytes).
+**`Read()`** = `GET_FEATURE` of 65 bytes — *mandatory*; the app interleaves a GET
+after most SETs (this is the ~4× GET vs SET we measured).
+
+**A. Effects / static color — `UpdateMode`** (the path "all keys solid red" uses):
+```
+1.  04 18                                 SetCustomization(ON)    ; Send ; Read
+2.  04 13  [8]=01                          StartEffectPage         ; Send ; Read
+3.  <mode> [1..3]=R,G,B  [8]=randomFlag     the MODE FRAME          ; Send ; Read
+            [9]=brightness [10]=speed
+            [11]=direction [14]=AA [15]=55
+4.  04 02                                  EndCommunication        ; Send ; Read
+5.  04 F0                                  StartEffectCommand      ; Send
+```
+> Our entire failure: we sent only step 3. It renders nothing without 1–2 before
+> and 4–5 after.
+
+**B. Per-key real-time — `SendDirect` (mode `0x20`, volatile):**
+```
+1.  04 20 [8]=08                           direct-mode header      ; Send
+2.  SendLEDsBuffer  (8 packets, below)     per-key colors          ; Send ×8
+3.  Read()
+4.  04 02                                  EndCommunication        ; Send
+```
+> **⚠ Keepalive:** Direct mode is dropped by the board after ~2 s unless re-sent.
+> The GMK67 driver runs a 2000 ms keepalive thread. The clackd engine actor must
+> schedule a periodic Direct refresh while a Direct frame is active.
+
+**C. Per-key saved — `SendCustom` (mode `0x23`):** `SetCustomization(ON)` →
+`04 23 [8]=09` → `SendLEDsBuffer` → `Read` → `EndCommunication` →
+`StartEffectCommand` → then a trailing `LIGHTS_OFF` (mode `0x80`, `[1]=FF [8]=01
+[9]=0F [10]=0F`, `AA/55`) effect-page write + `EndCommunication` +
+`StartEffectCommand` (verbatim from the source).
+
+**`SendLEDsBuffer` — per-key data, 8 × 64-byte packets, NO `0x04` header:**
+```
+color_buf[512] = {0}
+for slot l in 0 .. pos.len():
+    if pos[l] != NA:
+        color_buf[l*4 + 0] = l                 (slot index)
+        color_buf[l*4 + 1..3] = R,G,B of colors[pos[l]]
+send color_buf as 8 chunks of 64 bytes
+```
+This is exactly the framebuffer read back via `GET` (`10 R G B  11 R G B …`),
+which finally explains the earlier "per-key buffer" / "byte 3 = ff" observations.
+
+### LED matrix map (16 wide × 5 high; 66 LEDs, indices 0–65; `NA` = no LED)
+```
+row0: { 0, 5, 7,12,16,20,24,29,33,37,41,46,51,55,NA,NA}
+row1: { 1,NA, 8,13,17,21,25,30,34,38,42,47,52,56,58,62}
+row2: { 2,NA, 9,14,18,22,26,31,35,39,43,48,53,NA,59,63}
+row3: { 3,NA,10,15,19,23,27,32,36,40,44,49,54,NA,60,64}
+row4: { 4, 6,11,NA,NA,NA,28,NA,NA,NA,45,50,NA,57,61,65}
+```
+LED index → key (from `led_names`): 0 Esc, 1 Tab, 2 Caps, 3 LShift, 4 LCtrl,
+5 `1`, 6 LWin, 7 `2`, 8 Q, 9 A, 10 Z, 11 LAlt, 12 `3`, 13 W, 14 S, 15 X, 16 `4`,
+17 E, 18 D, 19 C, 20 `5`, 21 R, 22 F, 23 V, 24 `6`, 25 T, 26 G, 27 B, 28 Space,
+29 `7`, 30 Y, 31 H, 32 N, 33 `8`, 34 U, 35 J, 36 M, 37 `9`, 38 I, 39 K, 40 `,`,
+41 `0`, 42 O, 43 L, 44 `.`, 45 RAlt, 46 `-`, 47 P, 48 `;`, 49 `/`, 50 RFn,
+51 `=`/Numpad+, 52 `[`, 53 `'`, 54 RShift, 55 Backspace, 56 `]`, 57 Left,
+58 `\`, 59 Enter, 60 Up, 61 Down, 62 Del, 63 PgUp, 64 PgDn, 65 Right.
+`positions_custom` (128 entries) maps each framebuffer slot `l` → LED index for
+Direct/Custom mode.
+> EK68 is a 68-key board vs the GMK67 66-LED map here — **verify the EK68's exact
+> LED count and any extra slots on hardware**, but start from this map.
+
+### Driver implications for `src/hal/epomaker.rs`
+- Replace the single-frame write with the **full `UpdateMode` transaction**
+  (effects/static) and **`SendDirect`** (per-key), each `Send` followed by `Read()`.
+- Add a **~2 s Direct-mode keepalive** in the engine actor (only while Direct active).
+- The guessed `pc_mode_handshake()` (INIT_A/INIT_B) is **superseded** — the real
+  "enter PC mode" is `SetCustomization(ON)` *inside* the transaction; drop the guesses.
+- Clamp brightness/speed to `0x00..0x0F`.
+- Leads for the rest: key-definition area (`0x10`/`0x11`) for remap read/write and
+  macro area (`0x14`/`0x15`) for macros.
+
 ---
 
 ## 4. Matrix / topology  (for clackd `get_matrix_dimensions` / `get_layer_count`)
 
 | Field | Value |
 |---|---|
-| Rows | `TODO` |
-| Cols | `TODO` |
-| Layer count | `TODO` |
-| Physical→matrix key map | `TODO` |
+| LED matrix | **16 wide × 5 high** (80 cells, 66 populated LEDs, indices 0–65) — see §3.6 map |
+| Rows / Cols (keymap) | `TODO` — keymap matrix may differ from the LED matrix; confirm on hardware |
+| Layer count | base + Fn (`EK68_LAYERS = 2`, per approved plan) — `TODO` confirm wire encoding |
+| Physical→LED map | confirmed (GMK67 `matrix_map` / `led_names`, §3.6); EK68 68-key delta `TODO` |
 
 ---
 

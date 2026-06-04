@@ -9,43 +9,55 @@
 //! USB `05ac:024f`, maker `hfd.cn`) does **not** expose the VIA Usage Page.
 //! Its configuration channel is a **64-byte HID *Feature* report** on
 //! **interface 0**, driven over the control pipe via `SET_REPORT(Feature)` /
-//! `GET_REPORT(Feature)` — there is no OUT endpoint. The full reverse-
-//! engineering record lives in `docs/protocol/epomaker-ek68.md`; the
+//! `GET_REPORT(Feature)` — there is no OUT endpoint.
+//!
+//! The EK68 is firmware-identical to the **Zuoya GMK67** (same `05ac:024f`,
+//! interface 0, usage `0001:0006`), reverse-engineered for OpenRGB by Aubry
+//! Flora. The full record lives in `docs/protocol/epomaker-ek68.md` §3.6; the
 //! load-bearing facts this module encodes:
 //!
-//! ## Lighting (fully decoded)
+//! ## Lighting — a multi-frame *transaction* (the crucial point)
 //!
-//! A single 64-byte frame sets the whole-keyboard lighting:
+//! A colour/effect does **not** render from a single frame. The render is a
+//! transaction whose framing commands carry `PACKET_HEADER = 0x04` in byte 0
+//! (these are the frames we long mistook for "heartbeats"). For an effect or
+//! static colour ([`EpomakerDriver::render_effect`]):
 //!
-//! | Offset | Field                                            |
-//! |--------|--------------------------------------------------|
-//! | 0      | effect/mode id (`0x00` off, `0x01` static … `0x13` shuttle) |
-//! | 1..3   | R, G, B                                          |
-//! | 8      | rainbow / multicolor flag (`0x01` on Colourful/Spectrum) |
-//! | 9      | brightness `0x01`–`0x10`                          |
-//! | 10     | `0x0B` when lit, `0x01` when off                 |
-//! | 14..15 | `AA 55` footer magic                             |
+//! ```text
+//! 04 18                          SetCustomization(ON)     Send → Read
+//! 04 13  [8]=01                  StartEffectPage          Send → Read
+//! <mode> [1..3]=RGB [8]=random   the MODE FRAME           Send → Read
+//!        [9]=brightness [10]=speed [11]=direction [14..15]=AA 55
+//! 04 02                          EndCommunication         Send → Read
+//! 04 F0                          StartEffectCommand       Send
+//! ```
 //!
-//! There is **no payload checksum** (confirmed by diffing red/green/blue —
-//! only the RGB bytes changed).
+//! Each `Send` (`SET_REPORT`) is paced by a `Read` (`GET_REPORT`) — the app
+//! interleaves them and the firmware appears to expect it. Sending only the
+//! middle mode frame (as an earlier revision did) renders nothing. There is
+//! **no payload checksum**; `AA 55` at bytes 14–15 is a fixed page-check code.
+//!
+//! Per-key colour (`Direct` mode `0x20` / `Custom` `0x23`) pushes a 128-slot
+//! `index,R,G,B` framebuffer and, for `Direct`, needs a ≤2 s keepalive. That
+//! path is not wired through the VIA-shaped [`KeyboardDriver`] trait yet (it
+//! needs an engine-side refresh task) and is deferred; see the protocol doc.
 //!
 //! ## Keymap / remap (format decoded; addressing pending hardware test)
 //!
 //! A remap is a *select* frame (`02 00 <source-key default scancode>`)
 //! followed by a *write* frame (`02 00 <keycode-lo> <keycode-hi>`), keycodes
 //! being standard VIA/QMK values. The keyboard identifies the source key by
-//! its factory scancode (the write offset is a per-row column position and
-//! is **not** a globally-unique slot — `E` and `5` produce byte-identical
-//! writes). Because that disambiguation is not observable in passive
-//! captures, the exact offset/select requirement is finalized by testing
-//! against real hardware; this module emits the documented frames and keeps
-//! a host-side shadow keymap so the D-Bus API is coherent meanwhile
-//! (the legacy-polyfill shadow model, CLAUDE.md §4.2).
+//! its factory scancode (the write offset is a per-row column position and is
+//! **not** a globally-unique slot). The exact offset/select requirement is
+//! finalized against real hardware; this module emits the documented frames
+//! and keeps a host-side shadow keymap (the legacy-polyfill shadow model,
+//! CLAUDE.md §4.2). The GMK67 source names the key-definition area commands
+//! (`0x10` read / `0x11` write) as a future lead for read-back.
 //!
 //! ## Macros
 //!
-//! Not yet decoded (deliberately deferred). The macro methods operate on the
-//! shadow buffer only and are no-ops on the wire until the format is reversed.
+//! Not yet decoded (deferred). The macro methods operate on the shadow buffer
+//! only. The GMK67 source names the macro area (`0x14` read / `0x15` write).
 //!
 //! # IO Discipline
 //!
@@ -70,7 +82,8 @@ use tracing::{debug, info, warn};
 use crate::hal::{DriverError, KeyboardDriver};
 
 /// USB identifiers for the EK68 (non-VIA). Reports as "Apple" — a spoof;
-/// the real maker string is `hfd.cn`, product `EK68`.
+/// the real maker string is `hfd.cn`, product `EK68`. Firmware-identical to
+/// the Zuoya GMK67, which shares this exact VID/PID.
 pub const EK68_VID: u16 = 0x05AC;
 pub const EK68_PID: u16 = 0x024F;
 
@@ -87,27 +100,47 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 /// Maximum HID report descriptor size per `linux/hid.h`.
 const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 
-// --- Lighting frame layout (see module docs / docs/protocol/epomaker-ek68.md) ---
-const LIGHT_OFF_MODE: usize = 0;
-const LIGHT_OFF_R: usize = 1;
-const LIGHT_OFF_G: usize = 2;
-const LIGHT_OFF_B: usize = 3;
-const LIGHT_OFF_RAINBOW: usize = 8;
-const LIGHT_OFF_BRIGHTNESS: usize = 9;
-const LIGHT_OFF_MARKER: usize = 10;
-const LIGHT_OFF_FOOTER: usize = 14;
-const LIGHT_MARKER_LIT: u8 = 0x0B;
-const LIGHT_MARKER_OFF: u8 = 0x01;
+// --- Transaction framing (byte 0 = PACKET_HEADER, byte 1 = command) ---------
+//
+// These are the frames previously misread as "heartbeats". See §3.6.
+const PACKET_HEADER: u8 = 0x04;
+const CMD_COMMUNICATION_END: u8 = 0x02;
+const CMD_WRITE_LED_SPECIAL_EFFECT_AREA: u8 = 0x13;
+const CMD_TURN_ON_CUSTOMIZATION: u8 = 0x18;
+const CMD_TURN_OFF_CUSTOMIZATION: u8 = 0x19;
+const CMD_LED_EFFECT_START: u8 = 0xF0;
+/// Number of effect-page packets that follow `StartEffectPage` for a mode write.
+const LED_SPECIAL_EFFECT_PACKETS: u8 = 0x01;
+
+// --- Mode-frame layout (the middle frame of the transaction) -----------------
+const MF_MODE: usize = 0;
+const MF_R: usize = 1;
+const MF_G: usize = 2;
+const MF_B: usize = 3;
+const MF_RANDOM: usize = 8;
+const MF_BRIGHTNESS: usize = 9;
+const MF_SPEED: usize = 10;
+const MF_DIRECTION: usize = 11;
+const MF_FOOTER: usize = 14;
 const FOOTER_MAGIC: [u8; 2] = [0xAA, 0x55];
 
-/// Effect/mode ids (byte 0 of the lighting frame).
-pub const MODE_LED_OFF: u8 = 0x00;
+/// Effect/mode ids (byte 0 of the mode frame). Effects span `0x01..=0x13`;
+/// `0x80` is the dedicated lights-off mode. (`0x20`/`0x23` are the per-key
+/// Direct/Custom modes, handled by a separate framebuffer path — not here.)
 pub const MODE_STATIC: u8 = 0x01;
-/// Highest known effect id (`Shuttle`). Ids `0x00..=0x13` are valid.
-pub const MODE_MAX: u8 = 0x13;
+/// Highest known effect id (`Back-and-forth`).
+pub const MODE_EFFECT_MAX: u8 = 0x13;
+/// Dedicated lights-off mode.
+pub const MODE_LIGHTS_OFF: u8 = 0x80;
 
-const BRIGHTNESS_MIN: u8 = 0x01;
-const BRIGHTNESS_MAX: u8 = 0x10;
+const BRIGHTNESS_MIN: u8 = 0x00;
+const BRIGHTNESS_MAX: u8 = 0x0F;
+const SPEED_MAX: u8 = 0x0F;
+
+/// Whether `mode` is a renderable whole-keyboard mode this driver accepts.
+fn is_renderable_mode(mode: u8) -> bool {
+    (MODE_STATIC..=MODE_EFFECT_MAX).contains(&mode) || mode == MODE_LIGHTS_OFF
+}
 
 // --- Remap frame layout ---
 //
@@ -228,40 +261,56 @@ async fn join_with_timeout<T>(
 // Frame encoders (pure functions — unit tested)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Whole-keyboard lighting settings carried by one frame.
+/// Whole-keyboard lighting settings carried by the transaction's mode frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lighting {
     pub mode: u8,
     pub r: u8,
     pub g: u8,
     pub b: u8,
-    /// `0x01`–`0x10`; clamped into range on encode.
+    /// `0x00`–`0x0F`; clamped into range on encode.
     pub brightness: u8,
-    pub rainbow: bool,
+    /// `0x00`–`0x0F`; only meaningful for animated effects.
+    pub speed: u8,
+    /// Per-mode direction selector (gradient / sequence / back-and-forth).
+    pub direction: u8,
+    /// Random-colour flag (byte 8); replaces the old "rainbow" name.
+    pub random: bool,
 }
 
 impl Default for Lighting {
     fn default() -> Self {
-        Self { mode: MODE_STATIC, r: 0xFF, g: 0xFF, b: 0xFF, brightness: BRIGHTNESS_MAX, rainbow: false }
+        Self {
+            mode: MODE_STATIC,
+            r: 0xFF,
+            g: 0xFF,
+            b: 0xFF,
+            brightness: BRIGHTNESS_MAX,
+            speed: 0x00,
+            direction: 0x00,
+            random: false,
+        }
     }
 }
 
 impl Lighting {
-    /// Builds the 64-byte lighting payload per the decoded layout.
+    /// Builds the 64-byte mode frame (the middle of the render transaction).
     fn encode(&self) -> [u8; FRAME_LEN] {
         let mut f = [0u8; FRAME_LEN];
-        f[LIGHT_OFF_MODE] = self.mode;
-        f[LIGHT_OFF_R] = self.r;
-        f[LIGHT_OFF_G] = self.g;
-        f[LIGHT_OFF_B] = self.b;
-        f[LIGHT_OFF_RAINBOW] = self.rainbow as u8;
-        f[LIGHT_OFF_BRIGHTNESS] = self.brightness.clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
-        f[LIGHT_OFF_MARKER] = if self.mode == MODE_LED_OFF { LIGHT_MARKER_OFF } else { LIGHT_MARKER_LIT };
-        f[LIGHT_OFF_FOOTER..LIGHT_OFF_FOOTER + 2].copy_from_slice(&FOOTER_MAGIC);
+        f[MF_MODE] = self.mode;
+        f[MF_R] = self.r;
+        f[MF_G] = self.g;
+        f[MF_B] = self.b;
+        f[MF_RANDOM] = self.random as u8;
+        f[MF_BRIGHTNESS] = self.brightness.clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+        f[MF_SPEED] = self.speed.min(SPEED_MAX);
+        f[MF_DIRECTION] = self.direction;
+        f[MF_FOOTER..MF_FOOTER + 2].copy_from_slice(&FOOTER_MAGIC);
         f
     }
 
-    /// Parses a `set_lighting` D-Bus payload: `[mode, r, g, b, brightness?, rainbow?]`.
+    /// Parses a `set_lighting` D-Bus payload:
+    /// `[mode, r, g, b, brightness?, random?, speed?, direction?]`.
     /// Missing trailing fields fall back to defaults.
     fn from_bytes(data: &[u8]) -> Lighting {
         let d = Lighting::default();
@@ -271,13 +320,39 @@ impl Lighting {
             g: *data.get(2).unwrap_or(&d.g),
             b: *data.get(3).unwrap_or(&d.b),
             brightness: *data.get(4).unwrap_or(&d.brightness),
-            rainbow: data.get(5).map(|&x| x != 0).unwrap_or(d.rainbow),
+            random: data.get(5).map(|&x| x != 0).unwrap_or(d.random),
+            speed: *data.get(6).unwrap_or(&d.speed),
+            direction: *data.get(7).unwrap_or(&d.direction),
         }
     }
 
     fn to_bytes(self) -> Vec<u8> {
-        vec![self.mode, self.r, self.g, self.b, self.brightness, self.rainbow as u8]
+        vec![
+            self.mode,
+            self.r,
+            self.g,
+            self.b,
+            self.brightness,
+            self.random as u8,
+            self.speed,
+            self.direction,
+        ]
     }
+}
+
+/// A framing command frame: byte 0 = [`PACKET_HEADER`], byte 1 = `command`.
+fn encode_cmd(command: u8) -> [u8; FRAME_LEN] {
+    let mut f = [0u8; FRAME_LEN];
+    f[0] = PACKET_HEADER;
+    f[1] = command;
+    f
+}
+
+/// `StartEffectPage`: announces `LED_SPECIAL_EFFECT_PACKETS` follow-on packets.
+fn encode_start_effect_page() -> [u8; FRAME_LEN] {
+    let mut f = encode_cmd(CMD_WRITE_LED_SPECIAL_EFFECT_AREA);
+    f[8] = LED_SPECIAL_EFFECT_PACKETS;
+    f
 }
 
 /// Encodes the *select* frame that identifies the source key by its factory
@@ -299,44 +374,15 @@ fn encode_remap_write(keycode: u16) -> [u8; FRAME_LEN] {
     f
 }
 
-/// The frame sequence the Windows app emits on connect, *before* any lighting
-/// command.
-///
-/// **Why this exists (confirmed on hardware):** the board accepts and stores
-/// our lighting frames (they read back via `GET_REPORT`) but keeps *rendering*
-/// its onboard effect until this "enter PC / software-lighting mode" sequence
-/// runs. Captured host→device (`SET_REPORT`) traffic in the first second after
-/// the app connects; the load-bearing activation is the final frame
-/// (`byte5=0x01, byte8=0x02`, footer at 62), which is structurally unlike any
-/// lighting or heartbeat frame. The preceding frames replicate the app's
-/// connect preamble for fidelity. Sent exactly once per attach.
-fn pc_mode_handshake() -> [[u8; FRAME_LEN]; 7] {
-    let f = |pairs: &[(usize, u8)]| -> [u8; FRAME_LEN] {
-        let mut x = [0u8; FRAME_LEN];
-        for &(i, v) in pairs {
-            x[i] = v;
-        }
-        x
-    };
-    [
-        f(&[(0, 0x04), (1, 0x18)]),
-        f(&[(0, 0x04), (1, 0x13), (8, 0x01)]),
-        f(&[(9, 0x01), (10, 0x01), (14, 0xAA), (15, 0x55)]), // INIT_A (onboard LED-off frame)
-        f(&[(0, 0x04), (1, 0x02)]),
-        f(&[(0, 0x04), (1, 0xF0)]),
-        f(&[(0, 0x04), (1, 0x17), (2, 0x01), (8, 0x01)]),
-        f(&[(5, 0x01), (8, 0x02), (62, 0xAA), (63, 0x55)]), // INIT_B (enter PC-control)
-    ]
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Driver
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Epomaker EK68 driver. Lighting is pushed live; keymap/macros are held in a
-/// host-side shadow and flushed on [`KeyboardDriver::commit_to_nvram`]
-/// (CLAUDE.md §4.2 legacy-polyfill model), since the device offers no
-/// keymap read-back and writes its EEPROM on every change.
+/// Epomaker EK68 driver. Lighting is pushed live as the full render
+/// transaction; keymap/macros are held in a host-side shadow and flushed on
+/// [`KeyboardDriver::commit_to_nvram`] (CLAUDE.md §4.2 legacy-polyfill model),
+/// since the device offers no keymap read-back and writes its EEPROM on every
+/// change.
 pub struct EpomakerDriver {
     io: Box<dyn EpomakerIo>,
     device_id: Arc<str>,
@@ -347,8 +393,6 @@ pub struct EpomakerDriver {
     /// Positions changed since the last commit.
     dirty: BTreeMap<(u8, u8, u8), u16>,
     lighting: Lighting,
-    /// Whether the enter-PC-lighting-mode handshake has run this session.
-    pc_mode: bool,
 }
 
 impl EpomakerDriver {
@@ -389,21 +433,31 @@ impl EpomakerDriver {
             keymap: BTreeMap::new(),
             dirty: BTreeMap::new(),
             lighting: Lighting::default(),
-            pc_mode: false,
         }
     }
 
-    /// Sends the enter-PC-lighting-mode handshake once, on first use. Without
-    /// it the board ignores host lighting and shows its onboard effect.
-    async fn ensure_pc_mode(&mut self) -> Result<(), DriverError> {
-        if self.pc_mode {
-            return Ok(());
+    /// Issues the paced `GET_REPORT` that the app interleaves between writes.
+    /// Best-effort: the firmware appears to want the control-read to advance
+    /// the transaction, but its contents are not acted on, so a failed read is
+    /// logged and ignored rather than aborting a half-applied transaction.
+    async fn read_ack(&self) {
+        if let Err(e) = self.io.get_feature(REPORT_ID).await {
+            debug!(device_id = %self.device_id, error = %e, "EK68 transaction read-ack failed (ignored)");
         }
-        debug!(device_id = %self.device_id, "sending EK68 enter-PC-lighting-mode handshake");
-        for frame in pc_mode_handshake() {
-            self.io.set_feature(frame).await?;
-        }
-        self.pc_mode = true;
+    }
+
+    /// Runs the full effect/static render transaction (§3.6 path A). Without
+    /// the surrounding `0x04`-header framing the mode frame renders nothing.
+    async fn render_effect(&mut self, lighting: Lighting) -> Result<(), DriverError> {
+        self.io.set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION)).await?;
+        self.read_ack().await;
+        self.io.set_feature(encode_start_effect_page()).await?;
+        self.read_ack().await;
+        self.io.set_feature(lighting.encode()).await?;
+        self.read_ack().await;
+        self.io.set_feature(encode_cmd(CMD_COMMUNICATION_END)).await?;
+        self.read_ack().await;
+        self.io.set_feature(encode_cmd(CMD_LED_EFFECT_START)).await?;
         Ok(())
     }
 
@@ -451,14 +505,17 @@ impl KeyboardDriver for EpomakerDriver {
         Ok(())
     }
 
-    /// `command` is unused for the EK68; `data` is `[mode, r, g, b, brightness?, rainbow?]`.
+    /// `command` is unused for the EK68; `data` is
+    /// `[mode, r, g, b, brightness?, random?, speed?, direction?]`. The frame
+    /// is rendered via the full transaction (not a single write).
     async fn set_lighting(&mut self, _command: u8, data: &[u8]) -> Result<(), DriverError> {
         let lighting = Lighting::from_bytes(data);
-        if lighting.mode > MODE_MAX {
-            return Err(DriverError::ProtocolViolation { reason: "EK68 lighting mode out of range (0x00..=0x13)" });
+        if !is_renderable_mode(lighting.mode) {
+            return Err(DriverError::ProtocolViolation {
+                reason: "EK68 lighting mode out of range (effects 0x01..=0x13, or 0x80 off)",
+            });
         }
-        self.ensure_pc_mode().await?;
-        self.io.set_feature(lighting.encode()).await?;
+        self.render_effect(lighting).await?;
         self.lighting = lighting;
         debug!(device_id = %self.device_id, mode = lighting.mode, "set EK68 lighting");
         Ok(())
@@ -645,33 +702,47 @@ mod tests {
                 self.0.get_feature(r).await
             }
         }
-        EpomakerDriver::with_io(Box::new(Shim(io)), "ek68".into(), (5, 15), 1)
+        EpomakerDriver::with_io(Box::new(Shim(io)), "ek68".into(), (5, 16), 2)
     }
 
     #[test]
     fn lighting_static_red_layout() {
-        let f = Lighting { mode: MODE_STATIC, r: 0xFF, g: 0, b: 0, brightness: 0x10, rainbow: false }.encode();
-        assert_eq!(f[LIGHT_OFF_MODE], 0x01);
-        assert_eq!(f[LIGHT_OFF_R], 0xFF);
-        assert_eq!(f[LIGHT_OFF_G], 0x00);
-        assert_eq!(f[LIGHT_OFF_B], 0x00);
-        assert_eq!(f[LIGHT_OFF_BRIGHTNESS], 0x10);
-        assert_eq!(f[LIGHT_OFF_MARKER], LIGHT_MARKER_LIT);
-        assert_eq!(&f[LIGHT_OFF_FOOTER..LIGHT_OFF_FOOTER + 2], &FOOTER_MAGIC);
+        let f = Lighting {
+            mode: MODE_STATIC,
+            r: 0xFF,
+            g: 0,
+            b: 0,
+            brightness: 0x0F,
+            speed: 0x08,
+            direction: 0x01,
+            random: false,
+        }
+        .encode();
+        assert_eq!(f[MF_MODE], 0x01);
+        assert_eq!(f[MF_R], 0xFF);
+        assert_eq!(f[MF_G], 0x00);
+        assert_eq!(f[MF_B], 0x00);
+        assert_eq!(f[MF_RANDOM], 0x00);
+        assert_eq!(f[MF_BRIGHTNESS], 0x0F);
+        assert_eq!(f[MF_SPEED], 0x08);
+        assert_eq!(f[MF_DIRECTION], 0x01);
+        assert_eq!(&f[MF_FOOTER..MF_FOOTER + 2], &FOOTER_MAGIC);
     }
 
     #[test]
-    fn lighting_off_uses_off_marker() {
-        let f = Lighting { mode: MODE_LED_OFF, r: 0, g: 0, b: 0, brightness: 1, rainbow: false }.encode();
-        assert_eq!(f[LIGHT_OFF_MARKER], LIGHT_MARKER_OFF);
+    fn lighting_off_mode_is_0x80() {
+        let f = Lighting { mode: MODE_LIGHTS_OFF, ..Lighting::default() }.encode();
+        assert_eq!(f[MF_MODE], 0x80);
+        assert_eq!(&f[MF_FOOTER..MF_FOOTER + 2], &FOOTER_MAGIC);
     }
 
     #[test]
-    fn brightness_is_clamped() {
-        let f = Lighting { mode: MODE_STATIC, r: 1, g: 2, b: 3, brightness: 0xFF, rainbow: false }.encode();
-        assert_eq!(f[LIGHT_OFF_BRIGHTNESS], BRIGHTNESS_MAX);
+    fn brightness_and_speed_are_clamped() {
+        let f = Lighting { brightness: 0xFF, speed: 0xFF, ..Lighting::default() }.encode();
+        assert_eq!(f[MF_BRIGHTNESS], BRIGHTNESS_MAX);
+        assert_eq!(f[MF_SPEED], SPEED_MAX);
         let f0 = Lighting { brightness: 0x00, ..Lighting::default() }.encode();
-        assert_eq!(f0[LIGHT_OFF_BRIGHTNESS], BRIGHTNESS_MIN);
+        assert_eq!(f0[MF_BRIGHTNESS], BRIGHTNESS_MIN);
     }
 
     #[test]
@@ -690,44 +761,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_lighting_sends_one_frame() {
+    async fn set_lighting_runs_full_transaction() {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
-        d.pc_mode = true; // skip the handshake to isolate the lighting frame
         d.set_lighting(0, &[MODE_STATIC, 0x00, 0xFF, 0x00, 0x08, 0]).await.unwrap();
-        let sent = io.sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0][LIGHT_OFF_G], 0xFF);
-        assert_eq!(sent[0][LIGHT_OFF_BRIGHTNESS], 0x08);
-        // get_lighting reflects last set
-        assert_eq!(d.get_lighting(0).await.unwrap()[2], 0xFF);
-    }
 
-    #[tokio::test]
-    async fn handshake_runs_once_before_first_lighting() {
-        let io = Arc::new(MockIo::new());
-        let mut d = driver_with(io.clone());
-        d.set_lighting(0, &[MODE_STATIC, 0xFF, 0, 0, 0x10, 0]).await.unwrap();
-        let n = pc_mode_handshake().len();
         let sent = io.sent();
-        assert_eq!(sent.len(), n + 1, "handshake frames then the lighting frame");
-        // INIT_B (the enter-PC-control activation) is present in the handshake.
-        assert!(sent[..n].iter().any(|f| f[5] == 0x01 && f[8] == 0x02 && f[62] == 0xAA && f[63] == 0x55));
-        // The lighting frame comes last.
-        assert_eq!(sent[n][LIGHT_OFF_MODE], MODE_STATIC);
-        assert_eq!(sent[n][LIGHT_OFF_R], 0xFF);
-        // A second lighting call does NOT replay the handshake.
-        d.set_lighting(0, &[MODE_STATIC, 0, 0xFF, 0, 0x10, 0]).await.unwrap();
-        assert_eq!(io.sent().len(), n + 2);
+        assert_eq!(sent.len(), 5, "transaction = customization, page, mode, end, start");
+        // 1. SetCustomization(ON)
+        assert_eq!(sent[0][0], PACKET_HEADER);
+        assert_eq!(sent[0][1], CMD_TURN_ON_CUSTOMIZATION);
+        // 2. StartEffectPage
+        assert_eq!(sent[1][0], PACKET_HEADER);
+        assert_eq!(sent[1][1], CMD_WRITE_LED_SPECIAL_EFFECT_AREA);
+        assert_eq!(sent[1][8], LED_SPECIAL_EFFECT_PACKETS);
+        // 3. the mode frame
+        assert_eq!(sent[2][MF_MODE], MODE_STATIC);
+        assert_eq!(sent[2][MF_G], 0xFF);
+        assert_eq!(sent[2][MF_BRIGHTNESS], 0x08);
+        assert_eq!(&sent[2][MF_FOOTER..MF_FOOTER + 2], &FOOTER_MAGIC);
+        // 4. EndCommunication
+        assert_eq!(sent[3][0], PACKET_HEADER);
+        assert_eq!(sent[3][1], CMD_COMMUNICATION_END);
+        // 5. StartEffectCommand
+        assert_eq!(sent[4][0], PACKET_HEADER);
+        assert_eq!(sent[4][1], CMD_LED_EFFECT_START);
+
+        // get_lighting reflects the last set.
+        assert_eq!(d.get_lighting(0).await.unwrap()[2], 0xFF);
     }
 
     #[tokio::test]
     async fn out_of_range_mode_rejected() {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
+        // 0x14 is just past the effect range and is not the 0x80 off mode.
         let err = d.set_lighting(0, &[0x14, 0, 0, 0]).await.unwrap_err();
         assert!(matches!(err, DriverError::ProtocolViolation { .. }));
         assert!(io.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lighting_transaction_propagates_failure() {
+        let io = Arc::new(MockIo::failing());
+        let mut d = driver_with(io.clone());
+        assert!(matches!(
+            d.set_lighting(0, &[MODE_STATIC, 0xFF, 0, 0]).await,
+            Err(DriverError::Disconnected)
+        ));
     }
 
     #[tokio::test]
