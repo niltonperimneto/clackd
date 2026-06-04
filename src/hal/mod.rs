@@ -62,7 +62,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use thiserror::Error;
 
-pub mod gmk67;
+pub mod legacy;
 pub mod via;
 
 /// Errors raised by [`KeyboardDriver`] implementations.

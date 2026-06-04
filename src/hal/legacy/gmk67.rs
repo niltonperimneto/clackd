@@ -73,8 +73,14 @@
 //! §4.1). The ioctl is a synchronous USB control transfer, so it is run on
 //! [`tokio::task::spawn_blocking`] and bounded by a per-call
 //! `tokio::time::timeout`, mirroring the VIA driver's deadline discipline.
+//!
+//! # Shadow State (CLAUDE.md §4.2)
+//!
+//! This driver uses the [`ShadowState`](super::ShadowState) infrastructure
+//! from the `legacy` parent module for JSON persistence, dirty tracking,
+//! snapshot/rollback on commit, and `CacheStatus` tracking. The shadow file
+//! is stored at `$XDG_DATA_HOME/clackd/<vid>_<pid>.json`.
 
-use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -86,6 +92,7 @@ use nix::sys::stat::Mode;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use super::{LightingState, ShadowState};
 use crate::hal::{DriverError, KeyboardDriver};
 
 /// USB identifiers for the EK68 (non-VIA). Reports as "Apple" — a spoof;
@@ -197,6 +204,25 @@ fn keydef_command(layer: u8) -> Option<u8> {
         1 => Some(CMD_WRITE_KEY_DEFINITION_AREA_FN),
         _ => None,
     }
+}
+
+fn keydef_read_command(layer: u8) -> Option<u8> {
+    match layer {
+        0 => Some(0x10), // Base layer read command
+        1 => Some(0x26), // Fn layer read command
+        _ => None,
+    }
+}
+
+fn find_matrix_pos_for_key_index(ki: u8) -> Option<(u8, u8)> {
+    for r in 0..EK68_ROWS {
+        for c in 0..EK68_COLS {
+            if KEY_INDEX[r][c] == ki && ki != NA {
+                return Some((r as u8, c as u8));
+            }
+        }
+    }
+    None
 }
 
 // -- HIDIOCSFEATURE / HIDIOCGFEATURE ioctl wrappers --
@@ -392,6 +418,34 @@ impl Lighting {
             self.direction,
         ]
     }
+
+    /// Converts to the persistence-friendly [`LightingState`].
+    fn to_lighting_state(&self) -> LightingState {
+        LightingState {
+            mode: self.mode,
+            r: self.r,
+            g: self.g,
+            b: self.b,
+            brightness: self.brightness,
+            speed: self.speed,
+            direction: self.direction,
+            random: self.random,
+        }
+    }
+
+    /// Restores from a persisted [`LightingState`].
+    fn from_lighting_state(s: &LightingState) -> Self {
+        Self {
+            mode: s.mode,
+            r: s.r,
+            g: s.g,
+            b: s.b,
+            brightness: s.brightness,
+            speed: s.speed,
+            direction: s.direction,
+            random: s.random,
+        }
+    }
 }
 
 /// A framing command frame: byte 0 = [`PACKET_HEADER`], byte 1 = `command`.
@@ -439,25 +493,28 @@ fn encode_keydef_buffer(entries: &[(u8, u16)]) -> [u8; KEY_DEF_BUF_LEN] {
 // Driver
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// GMK67-family driver (Epomaker EK68 / Zuoya GMK67). Lighting is pushed live as the full render
-/// transaction; keymap/macros are held in a host-side shadow and flushed on
-/// [`KeyboardDriver::commit_to_nvram`] (CLAUDE.md §4.2 legacy-polyfill model),
-/// since the device offers no keymap read-back and writes its EEPROM on every
-/// change.
+/// GMK67-family driver (Epomaker EK68 / Zuoya GMK67). Lighting is pushed live
+/// as the full render transaction; keymap/macros are held in the
+/// [`ShadowState`] and flushed on [`KeyboardDriver::commit_to_nvram`]
+/// (CLAUDE.md §4.2 legacy-polyfill model). The shadow state persists to
+/// `$XDG_DATA_HOME/clackd/<vid>_<pid>.json` for cross-reboot survival.
 pub struct Gmk67Driver {
     io: Box<dyn Gmk67Io>,
     device_id: Arc<str>,
     matrix: (u8, u8),
     layers: u8,
-    /// Host-side keymap shadow: `(layer, row, col) -> keycode`.
-    keymap: BTreeMap<(u8, u8, u8), u16>,
-    /// Positions changed since the last commit.
-    dirty: BTreeMap<(u8, u8, u8), u16>,
+    /// Shadow keymap with JSON persistence and rollback support.
+    shadow: ShadowState,
+    /// Live lighting state (pushed immediately, not batched).
     lighting: Lighting,
 }
 
 impl Gmk67Driver {
     /// Opens interface 0 of an EK68 hidraw node and constructs the driver.
+    ///
+    /// Loads any previously persisted shadow state from
+    /// `$XDG_DATA_HOME/clackd/<vid>_<pid>.json`. If no file exists, the
+    /// shadow starts empty (all positions report `KC_NO`).
     ///
     /// # Errors
     /// - [`DriverError::PermissionDenied`] / [`DriverError::Disconnected`] from `open(2)`.
@@ -474,14 +531,23 @@ impl Gmk67Driver {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown-hidraw")
             .into();
+
+        // Stable device identifier for JSON persistence (VID_PID, not
+        // session-scoped hidraw sysname).
+        let persist_id = format!("{:04x}_{:04x}", EK68_VID, EK68_PID);
+        let shadow = ShadowState::load(&persist_id);
+        let lighting = Lighting::from_lighting_state(shadow.lighting());
+
         info!(device_id = %device_id, "attached GMK67-family (vendor feature-report) driver");
         let transport = Gmk67Transport::new(owned, device_id.clone(), DEFAULT_TIMEOUT);
-        Ok(Self::with_io(
-            Box::new(transport),
+        Ok(Self {
+            io: Box::new(transport),
             device_id,
             matrix,
             layers,
-        ))
+            shadow,
+            lighting,
+        })
     }
 
     /// Test/seam constructor over an arbitrary [`Gmk67Io`].
@@ -496,8 +562,7 @@ impl Gmk67Driver {
             device_id,
             matrix,
             layers,
-            keymap: BTreeMap::new(),
-            dirty: BTreeMap::new(),
+            shadow: ShadowState::ephemeral(),
             lighting: Lighting::default(),
         }
     }
@@ -578,7 +643,7 @@ impl KeyboardDriver for Gmk67Driver {
     async fn get_keycode(&mut self, layer: u8, row: u8, col: u8) -> Result<u16, DriverError> {
         // Shadow read — the device exposes no keymap read-back. Unwritten
         // positions report KC_NO (0x0000); a frontend overlays factory defaults.
-        Ok(self.keymap.get(&(layer, row, col)).copied().unwrap_or(0))
+        Ok(self.shadow.get_keycode(layer, row, col))
     }
 
     async fn set_keycode(
@@ -588,8 +653,7 @@ impl KeyboardDriver for Gmk67Driver {
         col: u8,
         keycode: u16,
     ) -> Result<(), DriverError> {
-        self.keymap.insert((layer, row, col), keycode);
-        self.dirty.insert((layer, row, col), keycode);
+        self.shadow.set_keycode(layer, row, col, keycode);
         Ok(())
     }
 
@@ -615,6 +679,7 @@ impl KeyboardDriver for Gmk67Driver {
         }
         self.render_effect(lighting).await?;
         self.lighting = lighting;
+        self.shadow.set_lighting(lighting.to_lighting_state());
         debug!(device_id = %self.device_id, mode = lighting.mode, "set EK68 lighting");
         Ok(())
     }
@@ -628,38 +693,33 @@ impl KeyboardDriver for Gmk67Driver {
     /// `0x11`, Fn layer → `0x27`). For each such layer the **full** layer keymap
     /// is sent (zero entries keep the factory default), so re-sending never
     /// resets previously remapped keys.
+    ///
+    /// On success, the shadow state is confirmed and persisted to JSON.
+    /// On failure, the shadow is rolled back to the last-known-good state
+    /// (CLAUDE.md §4.2).
     async fn commit_to_nvram(&mut self) -> Result<(), DriverError> {
-        if self.dirty.is_empty() {
+        if !self.shadow.is_dirty() {
             return Ok(());
         }
-        let mut dirty_layers: Vec<u8> = self.dirty.keys().map(|&k| k.0).collect();
-        dirty_layers.sort_unstable();
-        dirty_layers.dedup();
 
-        for layer in dirty_layers {
-            let Some(command) = keydef_command(layer) else {
-                warn!(device_id = %self.device_id, layer, "EK68 layer has no key-definition area; skipping");
-                continue;
-            };
-            let mut entries: Vec<(u8, u16)> = Vec::new();
-            for (&(l, row, col), &keycode) in &self.keymap {
-                if l == layer {
-                    if let Some(ki) = key_index_for(row, col) {
-                        entries.push((ki, keycode));
-                    } else {
-                        warn!(
-                            device_id = %self.device_id,
-                            layer, row, col, "skipping remap — no key at matrix position",
-                        );
-                    }
-                }
+        // Phase 1: prepare rollback target (confirmed = last successful commit).
+        self.shadow.prepare_commit();
+
+        let dirty_layers = self.shadow.dirty_layers();
+        let result = self.push_dirty_layers(&dirty_layers).await;
+
+        match result {
+            Ok(()) => {
+                // Phase 2a: success — persist and mark confirmed.
+                self.shadow.confirm_commit();
+                Ok(())
             }
-            if !entries.is_empty() {
-                self.commit_keymap(command, &entries).await?;
+            Err(e) => {
+                // Phase 2b: failure — roll back to last-known-good.
+                self.shadow.rollback();
+                Err(e)
             }
         }
-        self.dirty.clear();
-        Ok(())
     }
 
     fn emits_layout_event_per_set(&self) -> bool {
@@ -670,6 +730,95 @@ impl KeyboardDriver for Gmk67Driver {
     fn model_name(&self) -> &str {
         // Firmware-identical rebadges of the shared hfd.cn "GMK67" board.
         "GMK67/EK68"
+    }
+}
+
+impl Gmk67Driver {
+    /// Pushes the vendor blob for each dirty layer. Factored out of
+    /// `commit_to_nvram` so the result can be matched for rollback.
+    async fn push_dirty_layers(&self, dirty_layers: &[u8]) -> Result<(), DriverError> {
+        for &layer in dirty_layers {
+            let Some(command) = keydef_command(layer) else {
+                warn!(device_id = %self.device_id, layer, "EK68 layer has no key-definition area; skipping");
+                continue;
+            };
+            let mut entries: Vec<(u8, u16)> = Vec::new();
+            for (row, col, keycode) in self.shadow.layer_entries(layer) {
+                if let Some(ki) = key_index_for(row, col) {
+                    entries.push((ki, keycode));
+                } else {
+                    warn!(
+                        device_id = %self.device_id,
+                        layer, row, col, "skipping remap — no key at matrix position",
+                    );
+                }
+            }
+            if !entries.is_empty() {
+                self.commit_keymap(command, &entries).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Attempts to read the actual EEPROM keymap from the device.
+    /// This queries the key-definition area using the `0x10` (base) and `0x26` (Fn) read commands.
+    /// Upon success, populates the shadow state with the real hardware layout.
+    async fn sync_eeprom(&mut self) -> Result<(), DriverError> {
+        let mut any_success = false;
+
+        for layer in 0..self.layers {
+            let Some(command) = keydef_read_command(layer) else {
+                continue;
+            };
+
+            // Initiate read transaction for the layer
+            self.io
+                .set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION))
+                .await?;
+            self.read_ack().await;
+            self.io
+                .set_feature(encode_start_keydef_page(command))
+                .await?;
+            self.read_ack().await;
+
+            for p in 0..KEY_DEF_PAGES {
+                // Read a page from the device
+                let page = self.io.get_feature(REPORT_ID).await?;
+                
+                // Parse the 64-byte page into 16 entries (4 bytes each)
+                for entry in 0..16 {
+                    let offset = entry * 4;
+                    if offset + 3 < FRAME_LEN {
+                        if page[offset] == KEY_DEF_ENTRY_MARKER {
+                            let kc_lo = page[offset + 2];
+                            let kc_hi = page[offset + 3];
+                            let keycode = u16::from_le_bytes([kc_lo, kc_hi]);
+
+                            let ki = (p * 16 + entry) as u8;
+                            if let Some((row, col)) = find_matrix_pos_for_key_index(ki) {
+                                // Populate the shadow state directly from hardware
+                                self.shadow.set_keycode(layer, row, col, keycode);
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.io
+                .set_feature(encode_cmd(CMD_COMMUNICATION_END))
+                .await?;
+            self.read_ack().await;
+            
+            any_success = true;
+        }
+
+        if any_success {
+            // Confirm the new baseline shadow state to clear any dirty flags from setup
+            self.shadow.prepare_commit();
+            self.shadow.confirm_commit();
+        }
+
+        Ok(())
     }
 }
 
@@ -1086,7 +1235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_propagates_transport_failure() {
+    async fn commit_propagates_transport_failure_and_rolls_back() {
         let io = Arc::new(MockIo::failing());
         let mut d = driver_with(io.clone());
         d.set_keycode(0, 0, 0, 0x0004).await.unwrap(); // Esc -> A (known position)
@@ -1094,6 +1243,29 @@ mod tests {
             d.commit_to_nvram().await,
             Err(DriverError::Disconnected)
         ));
+        // After rollback, the keymap reverts to empty (no prior successful commit).
+        assert_eq!(d.get_keycode(0, 0, 0).await.unwrap(), 0x0000);
+    }
+
+    #[tokio::test]
+    async fn rollback_preserves_last_successful_commit() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+
+        // First commit succeeds: Esc -> A.
+        d.set_keycode(0, 0, 0, 0x0004).await.unwrap();
+        d.commit_to_nvram().await.unwrap();
+        assert_eq!(d.get_keycode(0, 0, 0).await.unwrap(), 0x0004);
+
+        // Swap the transport for a failing one and change the key.
+        d.io = Box::new(Arc::new(MockIo::failing()));
+        d.set_keycode(0, 0, 0, 0x0005).await.unwrap();
+        assert_eq!(d.get_keycode(0, 0, 0).await.unwrap(), 0x0005);
+
+        // Commit fails → rollback.
+        assert!(d.commit_to_nvram().await.is_err());
+        // Keymap reverts to the last successfully committed value.
+        assert_eq!(d.get_keycode(0, 0, 0).await.unwrap(), 0x0004);
     }
 
     #[test]

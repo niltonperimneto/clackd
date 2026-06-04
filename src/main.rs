@@ -46,7 +46,7 @@ use engine::messages::EngineCommand;
 use engine::{
     DaemonError, DriverTable, LifecycleEvent, ENGINE_CHANNEL_CAPACITY, LIFECYCLE_CHANNEL_CAPACITY,
 };
-use hal::gmk67::Gmk67Driver;
+use hal::legacy::gmk67::Gmk67Driver;
 use hal::via::ViaDriver;
 use hal::KeyboardDriver;
 

@@ -45,8 +45,8 @@ use tokio_stream::StreamExt;
 trait Clackd {
     /// Enumerate connected device ids.
     fn list_devices(&self) -> zbus::Result<Vec<String>>;
-    /// `(rows, cols, layer_count)` for a device.
-    fn get_device_info(&self, device_id: &str) -> zbus::Result<(u8, u8, u8)>;
+    /// `(model, rows, cols, layer_count)` for a device.
+    fn get_device_info(&self, device_id: &str) -> zbus::Result<(String, u8, u8, u8)>;
     /// Read the keycode at `(layer, row, col)`.
     fn get_keycode(&self, device_id: &str, layer: u8, row: u8, col: u8) -> zbus::Result<u16>;
     /// Write a keycode to `(layer, row, col)`.
@@ -228,7 +228,7 @@ async fn cmd_list(proxy: &ClackdProxy<'_>) -> Result<(), CliError> {
 
 async fn cmd_info(proxy: &ClackdProxy<'_>, device: &str) -> Result<(), CliError> {
     let id = resolve_device(proxy, device).await?;
-    let (rows, cols, layers) = proxy.get_device_info(&id).await?;
+    let (_model, rows, cols, layers) = proxy.get_device_info(&id).await?;
     println!("device {id}:");
     println!("  matrix:  {rows} rows × {cols} cols");
     println!("  layers:  {layers}");
