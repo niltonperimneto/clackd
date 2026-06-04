@@ -1,19 +1,25 @@
 #![allow(dead_code)]
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-//! Epomaker EK68 (non-VIA) proprietary HID driver.
+//! GMK67-family (non-VIA) proprietary HID driver.
+//!
+//! This is the shared `hfd.cn` "GMK67" protocol, used across firmware-identical
+//! rebadges — the **Epomaker EK68** and the **Zuoya GMK67** both report USB
+//! `05ac:024f` and speak it. The module is named for the protocol, not a single
+//! board; the `EK68_*` board constants below describe the specific variant the
+//! protocol was brought up against.
 //!
 //! # Protocol Overview
 //!
-//! Unlike [`crate::hal::via`], the EK68 (the non-VIA / "driver" model,
+//! Unlike [`crate::hal::via`], these boards (the non-VIA / "driver" model,
 //! USB `05ac:024f`, maker `hfd.cn`) does **not** expose the VIA Usage Page.
 //! Its configuration channel is a **64-byte HID *Feature* report** on
 //! **interface 0**, driven over the control pipe via `SET_REPORT(Feature)` /
 //! `GET_REPORT(Feature)` — there is no OUT endpoint.
 //!
 //! The EK68 is firmware-identical to the **Zuoya GMK67** (same `05ac:024f`,
-//! interface 0, usage `0001:0006`), reverse-engineered for OpenRGB by Aubry
-//! Flora. The full record lives in `docs/protocol/epomaker-ek68.md` section 4;
+//! interface 0, usage `0001:0006`), reverse-engineered for OpenRGB by Jurre
+//! Kol. The full record lives in `docs/protocol/epomaker-ek68.md` section 4;
 //! the
 //! load-bearing facts this module encodes:
 //!
@@ -22,7 +28,7 @@
 //! A colour/effect does **not** render from a single frame. The render is a
 //! transaction whose framing commands carry `PACKET_HEADER = 0x04` in byte 0
 //! (these are the frames we long mistook for "heartbeats"). For an effect or
-//! static colour ([`EpomakerDriver::render_effect`]):
+//! static colour ([`Gmk67Driver::render_effect`]):
 //!
 //! ```text
 //! 04 18                          SetCustomization(ON)     Send → Read
@@ -75,7 +81,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nix::fcntl::{open, OFlag};
+use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -88,7 +94,7 @@ use crate::hal::{DriverError, KeyboardDriver};
 pub const EK68_VID: u16 = 0x05AC;
 pub const EK68_PID: u16 = 0x024F;
 
-/// Epomaker vendor Feature-report payload length.
+/// GMK67-family vendor Feature-report payload length.
 const FRAME_LEN: usize = 64;
 
 /// Report ID prefix for the Feature report (none declared → 0x00).
@@ -178,7 +184,7 @@ const KEY_INDEX: [[u8; EK68_COLS]; EK68_ROWS] = [
 /// Maps a matrix position to the firmware `key_index`, or `None` for an empty
 /// cell / out-of-bounds.
 fn key_index_for(row: u8, col: u8) -> Option<u8> {
-    let ki = *KEY_INDEX.get(row as usize)?.get(col as usize)?;
+    let ki = KEY_INDEX.get(row as usize)?.get(col as usize).copied()?;
     (ki != NA).then_some(ki)
 }
 
@@ -216,10 +222,10 @@ nix::ioctl_read!(hidiocgrdesc, b'H', 0x02, HidrawReportDescriptor);
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The minimal hardware surface the driver needs. Implemented by
-/// [`EpomakerTransport`] in production and by a mock in tests, so the frame
+/// [`Gmk67Transport`] in production and by a mock in tests, so the frame
 /// encoding can be asserted without a device.
 #[async_trait]
-pub(crate) trait EpomakerIo: Send + Sync + 'static {
+pub(crate) trait Gmk67Io: Send + Sync + 'static {
     /// Sends one 64-byte Feature report (`SET_REPORT`).
     async fn set_feature(&self, payload: [u8; FRAME_LEN]) -> Result<(), DriverError>;
     /// Reads one 64-byte Feature report (`GET_REPORT`).
@@ -230,20 +236,24 @@ pub(crate) trait EpomakerIo: Send + Sync + 'static {
 ///
 /// Owns the fd behind an `Arc` so each ioctl can be moved into a
 /// `spawn_blocking` closure (the control transfer is synchronous).
-pub(crate) struct EpomakerTransport {
+pub(crate) struct Gmk67Transport {
     fd: Arc<OwnedFd>,
     device_id: Arc<str>,
     timeout: Duration,
 }
 
-impl EpomakerTransport {
+impl Gmk67Transport {
     fn new(fd: OwnedFd, device_id: Arc<str>, timeout: Duration) -> Self {
-        Self { fd: Arc::new(fd), device_id, timeout }
+        Self {
+            fd: Arc::new(fd),
+            device_id,
+            timeout,
+        }
     }
 }
 
 #[async_trait]
-impl EpomakerIo for EpomakerTransport {
+impl Gmk67Io for Gmk67Transport {
     async fn set_feature(&self, payload: [u8; FRAME_LEN]) -> Result<(), DriverError> {
         let fd = self.fd.clone();
         let dev = self.device_id.clone();
@@ -289,8 +299,13 @@ async fn join_with_timeout<T>(
     op: &'static str,
 ) -> Result<T, DriverError> {
     match timeout(dur, fut).await {
-        Err(_) => Err(DriverError::Timeout { device: device_id.to_string(), op }),
-        Ok(Err(_join)) => Err(DriverError::Io(std::io::Error::other("feature ioctl task panicked"))),
+        Err(_) => Err(DriverError::Timeout {
+            device: device_id.to_string(),
+            op,
+        }),
+        Ok(Err(_join)) => Err(DriverError::Io(std::io::Error::other(
+            "feature ioctl task panicked",
+        ))),
         Ok(Ok(Err(e))) => Err(classify_io_error(e)),
         Ok(Ok(Ok(v))) => Ok(v),
     }
@@ -354,14 +369,14 @@ impl Lighting {
     fn from_bytes(data: &[u8]) -> Lighting {
         let d = Lighting::default();
         Lighting {
-            mode: *data.first().unwrap_or(&d.mode),
-            r: *data.get(1).unwrap_or(&d.r),
-            g: *data.get(2).unwrap_or(&d.g),
-            b: *data.get(3).unwrap_or(&d.b),
-            brightness: *data.get(4).unwrap_or(&d.brightness),
+            mode: data.first().copied().unwrap_or(d.mode),
+            r: data.get(1).copied().unwrap_or(d.r),
+            g: data.get(2).copied().unwrap_or(d.g),
+            b: data.get(3).copied().unwrap_or(d.b),
+            brightness: data.get(4).copied().unwrap_or(d.brightness),
             random: data.get(5).map(|&x| x != 0).unwrap_or(d.random),
-            speed: *data.get(6).unwrap_or(&d.speed),
-            direction: *data.get(7).unwrap_or(&d.direction),
+            speed: data.get(6).copied().unwrap_or(d.speed),
+            direction: data.get(7).copied().unwrap_or(d.direction),
         }
     }
 
@@ -416,8 +431,7 @@ fn encode_keydef_buffer(entries: &[(u8, u16)]) -> [u8; KEY_DEF_BUF_LEN] {
             buf[o + 3] = hi;
         }
     }
-    buf[KEY_DEF_BUF_LEN - 2] = FOOTER_MAGIC[0]; // page 8, byte 62
-    buf[KEY_DEF_BUF_LEN - 1] = FOOTER_MAGIC[1]; // page 8, byte 63
+    buf[KEY_DEF_BUF_LEN - 2..].copy_from_slice(&FOOTER_MAGIC);
     buf
 }
 
@@ -425,13 +439,13 @@ fn encode_keydef_buffer(entries: &[(u8, u16)]) -> [u8; KEY_DEF_BUF_LEN] {
 // Driver
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Epomaker EK68 driver. Lighting is pushed live as the full render
+/// GMK67-family driver (Epomaker EK68 / Zuoya GMK67). Lighting is pushed live as the full render
 /// transaction; keymap/macros are held in a host-side shadow and flushed on
 /// [`KeyboardDriver::commit_to_nvram`] (CLAUDE.md §4.2 legacy-polyfill model),
 /// since the device offers no keymap read-back and writes its EEPROM on every
 /// change.
-pub struct EpomakerDriver {
-    io: Box<dyn EpomakerIo>,
+pub struct Gmk67Driver {
+    io: Box<dyn Gmk67Io>,
     device_id: Arc<str>,
     matrix: (u8, u8),
     layers: u8,
@@ -442,7 +456,7 @@ pub struct EpomakerDriver {
     lighting: Lighting,
 }
 
-impl EpomakerDriver {
+impl Gmk67Driver {
     /// Opens interface 0 of an EK68 hidraw node and constructs the driver.
     ///
     /// # Errors
@@ -460,14 +474,19 @@ impl EpomakerDriver {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown-hidraw")
             .into();
-        info!(device_id = %device_id, "attached Epomaker EK68 (vendor feature-report) driver");
-        let transport = EpomakerTransport::new(owned, device_id.clone(), DEFAULT_TIMEOUT);
-        Ok(Self::with_io(Box::new(transport), device_id, matrix, layers))
+        info!(device_id = %device_id, "attached GMK67-family (vendor feature-report) driver");
+        let transport = Gmk67Transport::new(owned, device_id.clone(), DEFAULT_TIMEOUT);
+        Ok(Self::with_io(
+            Box::new(transport),
+            device_id,
+            matrix,
+            layers,
+        ))
     }
 
-    /// Test/seam constructor over an arbitrary [`EpomakerIo`].
+    /// Test/seam constructor over an arbitrary [`Gmk67Io`].
     pub(crate) fn with_io(
-        io: Box<dyn EpomakerIo>,
+        io: Box<dyn Gmk67Io>,
         device_id: Arc<str>,
         matrix: (u8, u8),
         layers: u8,
@@ -496,15 +515,21 @@ impl EpomakerDriver {
     /// Runs the full effect/static render transaction (doc section 4.3). Without
     /// the surrounding `0x04`-header framing the mode frame renders nothing.
     async fn render_effect(&mut self, lighting: Lighting) -> Result<(), DriverError> {
-        self.io.set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION)).await?;
+        self.io
+            .set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION))
+            .await?;
         self.read_ack().await;
         self.io.set_feature(encode_start_effect_page()).await?;
         self.read_ack().await;
         self.io.set_feature(lighting.encode()).await?;
         self.read_ack().await;
-        self.io.set_feature(encode_cmd(CMD_COMMUNICATION_END)).await?;
+        self.io
+            .set_feature(encode_cmd(CMD_COMMUNICATION_END))
+            .await?;
         self.read_ack().await;
-        self.io.set_feature(encode_cmd(CMD_LED_EFFECT_START)).await?;
+        self.io
+            .set_feature(encode_cmd(CMD_LED_EFFECT_START))
+            .await?;
         Ok(())
     }
 
@@ -515,9 +540,13 @@ impl EpomakerDriver {
     /// `key_index -> keycode` for that layer.
     async fn commit_keymap(&self, command: u8, entries: &[(u8, u16)]) -> Result<(), DriverError> {
         let buf = encode_keydef_buffer(entries);
-        self.io.set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION)).await?;
+        self.io
+            .set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION))
+            .await?;
         self.read_ack().await;
-        self.io.set_feature(encode_start_keydef_page(command)).await?;
+        self.io
+            .set_feature(encode_start_keydef_page(command))
+            .await?;
         self.read_ack().await;
         for p in 0..KEY_DEF_PAGES {
             let mut page = [0u8; FRAME_LEN];
@@ -525,15 +554,19 @@ impl EpomakerDriver {
             self.io.set_feature(page).await?;
             self.read_ack().await;
         }
-        self.io.set_feature(encode_cmd(CMD_COMMUNICATION_END)).await?;
+        self.io
+            .set_feature(encode_cmd(CMD_COMMUNICATION_END))
+            .await?;
         self.read_ack().await;
-        self.io.set_feature(encode_cmd(CMD_LED_EFFECT_START)).await?;
+        self.io
+            .set_feature(encode_cmd(CMD_LED_EFFECT_START))
+            .await?;
         Ok(())
     }
 }
 
 #[async_trait]
-impl KeyboardDriver for EpomakerDriver {
+impl KeyboardDriver for Gmk67Driver {
     async fn get_matrix_dimensions(&mut self) -> Result<(u8, u8), DriverError> {
         Ok(self.matrix)
     }
@@ -548,7 +581,13 @@ impl KeyboardDriver for EpomakerDriver {
         Ok(self.keymap.get(&(layer, row, col)).copied().unwrap_or(0))
     }
 
-    async fn set_keycode(&mut self, layer: u8, row: u8, col: u8, keycode: u16) -> Result<(), DriverError> {
+    async fn set_keycode(
+        &mut self,
+        layer: u8,
+        row: u8,
+        col: u8,
+        keycode: u16,
+    ) -> Result<(), DriverError> {
         self.keymap.insert((layer, row, col), keycode);
         self.dirty.insert((layer, row, col), keycode);
         Ok(())
@@ -593,7 +632,7 @@ impl KeyboardDriver for EpomakerDriver {
         if self.dirty.is_empty() {
             return Ok(());
         }
-        let mut dirty_layers: Vec<u8> = self.dirty.keys().map(|&(layer, _, _)| layer).collect();
+        let mut dirty_layers: Vec<u8> = self.dirty.keys().map(|&k| k.0).collect();
         dirty_layers.sort_unstable();
         dirty_layers.dedup();
 
@@ -603,16 +642,16 @@ impl KeyboardDriver for EpomakerDriver {
                 continue;
             };
             let mut entries: Vec<(u8, u16)> = Vec::new();
-            for (&(l, row, col), &keycode) in self.keymap.iter() {
-                if l != layer {
-                    continue;
-                }
-                match key_index_for(row, col) {
-                    Some(ki) => entries.push((ki, keycode)),
-                    None => warn!(
-                        device_id = %self.device_id,
-                        layer, row, col, "skipping remap — no key at matrix position",
-                    ),
+            for (&(l, row, col), &keycode) in &self.keymap {
+                if l == layer {
+                    if let Some(ki) = key_index_for(row, col) {
+                        entries.push((ki, keycode));
+                    } else {
+                        warn!(
+                            device_id = %self.device_id,
+                            layer, row, col, "skipping remap — no key at matrix position",
+                        );
+                    }
                 }
             }
             if !entries.is_empty() {
@@ -627,6 +666,11 @@ impl KeyboardDriver for EpomakerDriver {
         // Writes are batched until commit, so the event fires once per flush.
         false
     }
+
+    fn model_name(&self) -> &str {
+        // Firmware-identical rebadges of the shared hfd.cn "GMK67" board.
+        "GMK67/EK68"
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -636,7 +680,9 @@ impl KeyboardDriver for EpomakerDriver {
 fn classify_open_errno(errno: nix::errno::Errno, path: &Path) -> DriverError {
     use nix::errno::Errno;
     match errno {
-        Errno::EACCES | Errno::EPERM => DriverError::PermissionDenied { path: path.to_path_buf() },
+        Errno::EACCES | Errno::EPERM => DriverError::PermissionDenied {
+            path: path.to_path_buf(),
+        },
         Errno::ENODEV | Errno::ENOENT => DriverError::Disconnected,
         other => DriverError::Io(std::io::Error::from_raw_os_error(other as i32)),
     }
@@ -645,7 +691,9 @@ fn classify_open_errno(errno: nix::errno::Errno, path: &Path) -> DriverError {
 fn classify_io_error(e: std::io::Error) -> DriverError {
     use std::io::ErrorKind;
     match e.kind() {
-        ErrorKind::PermissionDenied => DriverError::PermissionDenied { path: PathBuf::new() },
+        ErrorKind::PermissionDenied => DriverError::PermissionDenied {
+            path: PathBuf::new(),
+        },
         ErrorKind::NotFound | ErrorKind::BrokenPipe => DriverError::Disconnected,
         _ => DriverError::Io(e),
     }
@@ -662,9 +710,14 @@ fn probe_vendor_feature_interface(fd: &OwnedFd) -> Result<(), DriverError> {
     let raw_fd = fd.as_raw_fd();
     let mut desc_size: std::os::raw::c_int = 0;
     // SAFETY: reads a single c_int from a valid hidraw fd.
-    unsafe { hidiocgrdescsize(raw_fd, &mut desc_size).map_err(|e| DriverError::Io(io_from_errno(e)))? };
+    unsafe {
+        hidiocgrdescsize(raw_fd, &mut desc_size).map_err(|e| DriverError::Io(io_from_errno(e)))?
+    };
 
-    let mut rpt = HidrawReportDescriptor { size: desc_size as u32, value: [0u8; HID_MAX_DESCRIPTOR_SIZE] };
+    let mut rpt = HidrawReportDescriptor {
+        size: desc_size as u32,
+        value: [0u8; HID_MAX_DESCRIPTOR_SIZE],
+    };
     // SAFETY: fills the struct, size field set from the query above.
     unsafe { hidiocgrdesc(raw_fd, &mut rpt).map_err(|e| DriverError::Io(io_from_errno(e)))? };
 
@@ -694,26 +747,36 @@ pub(crate) fn descriptor_has_feature_report(descriptor: &[u8], min_count: u32) -
             if i + 1 >= descriptor.len() {
                 break;
             }
-            i += 3 + descriptor[i + 1] as usize;
+            let data_len = descriptor[i + 1] as usize;
+            i += 3 + data_len;
             continue;
         }
-        let data_len = match prefix & 0x03 {
+
+        // Short item: bits [1:0] encode data size.
+        let size_code = prefix & 0x03;
+        let data_len = match size_code {
             0 => 0,
             1 => 1,
             2 => 2,
-            _ => 4,
+            3 => 4,
+            _ => unreachable!(),
         };
-        let read_data = |n: usize| -> u32 {
-            let mut v: u32 = 0;
-            for k in 0..n {
-                if i + 1 + k < descriptor.len() {
-                    v |= (descriptor[i + 1 + k] as u32) << (8 * k);
-                }
+
+        // Tag+type is bits [7:2].
+        let tag_type = prefix & 0xFC;
+        match tag_type {
+            0x94 => {
+                // Report Count (global)
+                let slice = &descriptor[i + 1..];
+                report_count = match data_len {
+                    1 if !slice.is_empty() => slice[0] as u32,
+                    2 if slice.len() >= 2 => u16::from_le_bytes([slice[0], slice[1]]) as u32,
+                    4 if slice.len() >= 4 => {
+                        u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]])
+                    }
+                    _ => 0,
+                };
             }
-            v
-        };
-        match prefix & 0xFC {
-            0x94 => report_count = read_data(data_len), // Report Count (global)
             0xB0 => {
                 // Feature (main)
                 if report_count >= min_count {
@@ -739,17 +802,23 @@ mod tests {
     }
     impl MockIo {
         fn new() -> Self {
-            Self { sent: Mutex::new(Vec::new()), fail: false }
+            Self {
+                sent: Mutex::new(Vec::new()),
+                fail: false,
+            }
         }
         fn failing() -> Self {
-            Self { sent: Mutex::new(Vec::new()), fail: true }
+            Self {
+                sent: Mutex::new(Vec::new()),
+                fail: true,
+            }
         }
         fn sent(&self) -> Vec<[u8; FRAME_LEN]> {
             self.sent.lock().unwrap().clone()
         }
     }
     #[async_trait]
-    impl EpomakerIo for MockIo {
+    impl Gmk67Io for MockIo {
         async fn set_feature(&self, payload: [u8; FRAME_LEN]) -> Result<(), DriverError> {
             if self.fail {
                 return Err(DriverError::Disconnected);
@@ -762,19 +831,18 @@ mod tests {
         }
     }
 
-    fn driver_with(io: Arc<MockIo>) -> EpomakerDriver {
-        // Box a thin shim so the test keeps a handle to the Arc for assertions.
-        struct Shim(Arc<MockIo>);
-        #[async_trait]
-        impl EpomakerIo for Shim {
-            async fn set_feature(&self, p: [u8; FRAME_LEN]) -> Result<(), DriverError> {
-                self.0.set_feature(p).await
-            }
-            async fn get_feature(&self, r: u8) -> Result<[u8; FRAME_LEN], DriverError> {
-                self.0.get_feature(r).await
-            }
+    #[async_trait]
+    impl Gmk67Io for Arc<MockIo> {
+        async fn set_feature(&self, payload: [u8; FRAME_LEN]) -> Result<(), DriverError> {
+            self.as_ref().set_feature(payload).await
         }
-        EpomakerDriver::with_io(Box::new(Shim(io)), "ek68".into(), (5, 15), 2)
+        async fn get_feature(&self, report_id: u8) -> Result<[u8; FRAME_LEN], DriverError> {
+            self.as_ref().get_feature(report_id).await
+        }
+    }
+
+    fn driver_with(io: Arc<MockIo>) -> Gmk67Driver {
+        Gmk67Driver::with_io(Box::new(io), "ek68".into(), (5, 15), 2)
     }
 
     #[test]
@@ -803,17 +871,30 @@ mod tests {
 
     #[test]
     fn lighting_off_mode_is_0x80() {
-        let f = Lighting { mode: MODE_LIGHTS_OFF, ..Lighting::default() }.encode();
+        let f = Lighting {
+            mode: MODE_LIGHTS_OFF,
+            ..Lighting::default()
+        }
+        .encode();
         assert_eq!(f[MF_MODE], 0x80);
         assert_eq!(&f[MF_FOOTER..MF_FOOTER + 2], &FOOTER_MAGIC);
     }
 
     #[test]
     fn brightness_and_speed_are_clamped() {
-        let f = Lighting { brightness: 0xFF, speed: 0xFF, ..Lighting::default() }.encode();
+        let f = Lighting {
+            brightness: 0xFF,
+            speed: 0xFF,
+            ..Lighting::default()
+        }
+        .encode();
         assert_eq!(f[MF_BRIGHTNESS], BRIGHTNESS_MAX);
         assert_eq!(f[MF_SPEED], SPEED_MAX);
-        let f0 = Lighting { brightness: 0x00, ..Lighting::default() }.encode();
+        let f0 = Lighting {
+            brightness: 0x00,
+            ..Lighting::default()
+        }
+        .encode();
         assert_eq!(f0[MF_BRIGHTNESS], BRIGHTNESS_MIN);
     }
 
@@ -853,10 +934,16 @@ mod tests {
     async fn set_lighting_runs_full_transaction() {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
-        d.set_lighting(0, &[MODE_STATIC, 0x00, 0xFF, 0x00, 0x08, 0]).await.unwrap();
+        d.set_lighting(0, &[MODE_STATIC, 0x00, 0xFF, 0x00, 0x08, 0])
+            .await
+            .unwrap();
 
         let sent = io.sent();
-        assert_eq!(sent.len(), 5, "transaction = customization, page, mode, end, start");
+        assert_eq!(
+            sent.len(),
+            5,
+            "transaction = customization, page, mode, end, start"
+        );
         // 1. SetCustomization(ON)
         assert_eq!(sent[0][0], PACKET_HEADER);
         assert_eq!(sent[0][1], CMD_TURN_ON_CUSTOMIZATION);
@@ -905,15 +992,24 @@ mod tests {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
         d.set_keycode(0, 0, 0, 0x0004).await.unwrap(); // Esc (key_index 1) -> A
-        assert!(io.sent().is_empty(), "writes must not hit the wire before commit");
+        assert!(
+            io.sent().is_empty(),
+            "writes must not hit the wire before commit"
+        );
         assert_eq!(d.get_keycode(0, 0, 0).await.unwrap(), 0x0004);
 
         d.commit_to_nvram().await.unwrap();
         let sent = io.sent();
         // transaction = 04 18, 04 11, 9 pages, 04 02, 04 f0 = 13 frames.
         assert_eq!(sent.len(), 2 + KEY_DEF_PAGES + 2);
-        assert_eq!((sent[0][0], sent[0][1]), (PACKET_HEADER, CMD_TURN_ON_CUSTOMIZATION));
-        assert_eq!((sent[1][0], sent[1][1]), (PACKET_HEADER, CMD_WRITE_KEY_DEFINITION_AREA));
+        assert_eq!(
+            (sent[0][0], sent[0][1]),
+            (PACKET_HEADER, CMD_TURN_ON_CUSTOMIZATION)
+        );
+        assert_eq!(
+            (sent[1][0], sent[1][1]),
+            (PACKET_HEADER, CMD_WRITE_KEY_DEFINITION_AREA)
+        );
         assert_eq!(sent[1][8], KEY_DEF_PAGES as u8);
         // Esc entry at offset 4 lives in page 0 (frame index 2).
         assert_eq!(sent[2][4], KEY_DEF_ENTRY_MARKER);
@@ -922,8 +1018,14 @@ mod tests {
         assert_eq!(sent[2 + KEY_DEF_PAGES - 1][62], 0xAA);
         assert_eq!(sent[2 + KEY_DEF_PAGES - 1][63], 0x55);
         // Trailer.
-        assert_eq!((sent[11][0], sent[11][1]), (PACKET_HEADER, CMD_COMMUNICATION_END));
-        assert_eq!((sent[12][0], sent[12][1]), (PACKET_HEADER, CMD_LED_EFFECT_START));
+        assert_eq!(
+            (sent[11][0], sent[11][1]),
+            (PACKET_HEADER, CMD_COMMUNICATION_END)
+        );
+        assert_eq!(
+            (sent[12][0], sent[12][1]),
+            (PACKET_HEADER, CMD_LED_EFFECT_START)
+        );
 
         // Buffer cleared — a second commit is a no-op.
         d.commit_to_nvram().await.unwrap();
@@ -988,7 +1090,10 @@ mod tests {
         let io = Arc::new(MockIo::failing());
         let mut d = driver_with(io.clone());
         d.set_keycode(0, 0, 0, 0x0004).await.unwrap(); // Esc -> A (known position)
-        assert!(matches!(d.commit_to_nvram().await, Err(DriverError::Disconnected)));
+        assert!(matches!(
+            d.commit_to_nvram().await,
+            Err(DriverError::Disconnected)
+        ));
     }
 
     #[test]

@@ -1,0 +1,19 @@
+option('systemd',
+	type : 'feature',
+	value : 'auto',
+	description : 'Install the systemd user unit file')
+
+option('systemd-user-unit-dir',
+	type : 'string',
+	value : '',
+	description : 'systemd user unit directory [default=$libdir/systemd/user, or pkg-config systemduserunitdir]')
+
+option('dbus-root-dir',
+	type : 'string',
+	value : '',
+	description : 'dbus service directory [default=$datadir/dbus-1]')
+
+option('udev-dir',
+	type : 'string',
+	value : '',
+	description : 'udev rules directory [default=$prefix/lib/udev]')

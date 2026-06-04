@@ -1,0 +1,18 @@
+# D-Bus session-bus activation file for clackd (meson template).
+#
+# `@bindir@` is substituted at `meson install` time. The static sibling
+# `io.github.clackd.service` is kept for the manual install documented in
+# INSTALL.md; keep the two in sync.
+#
+# Effect: when any client calls a method on `io.github.clackd` and the
+# daemon is not already running, the session bus launches it via the
+# referenced systemd user unit, then waits for the unit to report ready
+# (`Type=notify` + `READY=1`) before routing the original call.
+
+[D-BUS Service]
+Name=io.github.clackd
+SystemdService=clackd.service
+# Exec is required by the D-Bus spec but is only used when SystemdService
+# is unavailable (e.g. systemd-less containers). Match the unit's
+# ExecStart path.
+Exec=@bindir@/clackd
