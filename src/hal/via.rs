@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 //! VIA native raw-HID driver.
@@ -72,16 +73,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nix::fcntl::{open, OFlag};
+use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{broadcast, mpsc, oneshot};
-
-use crate::engine::LifecycleEvent;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep_until, timeout, Instant};
+use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{debug, info, trace, warn};
 
+use crate::engine::LifecycleEvent;
 use crate::hal::{DriverError, KeyboardDriver};
 
 /// VIA wire-frame length. Fixed by the protocol; never changes between
@@ -95,6 +95,7 @@ const VIA_FRAME_LEN: usize = 32;
 /// byte; the kernel ignores it on devices without report IDs.
 const VIA_HIDRAW_REPORT_ID: u8 = 0x00;
 
+// --- VIA command IDs (from QMK `quantum/via.h`) ------------------------------
 const ID_DYNAMIC_KEYMAP_GET_KEYCODE: u8 = 0x04;
 const ID_DYNAMIC_KEYMAP_SET_KEYCODE: u8 = 0x05;
 const ID_DYNAMIC_KEYMAP_GET_LAYER_COUNT: u8 = 0x11;
@@ -326,7 +327,7 @@ impl CoalescerTransport for ViaTransport {
         // Protocol specifies we read `length` bytes after command echoes
         // Actually VIA just returns the buffer starting at byte 4.
         let mut result = Vec::with_capacity(length as usize);
-        let max_len = std::cmp::min(length as usize, VIA_FRAME_LEN - 4);
+        let max_len = (length as usize).min(VIA_FRAME_LEN - 4);
         result.extend_from_slice(&resp[4..4 + max_len]);
         Ok(result)
     }
@@ -337,7 +338,7 @@ impl CoalescerTransport for ViaTransport {
         let [off_hi, off_lo] = offset.to_be_bytes();
         req[1] = off_hi;
         req[2] = off_lo;
-        let max_len = std::cmp::min(data.len(), VIA_FRAME_LEN - 4);
+        let max_len = data.len().min(VIA_FRAME_LEN - 4);
         req[3] = max_len as u8;
         req[4..4 + max_len].copy_from_slice(&data[..max_len]);
         self.roundtrip(req, "set_macro_buffer").await?;
@@ -357,7 +358,7 @@ impl CoalescerTransport for ViaTransport {
         let mut req = [0u8; VIA_FRAME_LEN];
         req[0] = ID_LIGHTING_SET_VALUE;
         req[1] = lighting_cmd;
-        let max_len = std::cmp::min(data.len(), VIA_FRAME_LEN - 2);
+        let max_len = data.len().min(VIA_FRAME_LEN - 2);
         req[2..2 + max_len].copy_from_slice(&data[..max_len]);
         self.roundtrip(req, "set_lighting").await?;
         Ok(())
@@ -810,6 +811,10 @@ impl KeyboardDriver for ViaDriver {
         matches!(self.inner, ViaInner::Direct(_))
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Open / probe helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Shared open-and-probe routine for both [`ViaDriver::new`] and
 /// [`ViaDriver::with_coalescing`]. Returns the constructed transport
