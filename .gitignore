@@ -1,6 +1,8 @@
 CLAUDE.md
 .claude/
 target/
+build/
+build-release/
 
 # Python bytecode (from tools/*.py helpers)
 __pycache__/
@@ -9,3 +11,6 @@ __pycache__/
 # EK68 hardware-diagnostic scratch (capture dumps + personal scratch)
 tools/connect_*.txt
 tools/t.py
+.agents/skills/style/STYLE.md
+.agents/skills/skill/SKILL.md
+.agents/skills/handoff/SKILL.md

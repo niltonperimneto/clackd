@@ -1086,7 +1086,7 @@ mod tests {
     async fn set_lighting_runs_full_transaction() {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
-        d.set_lighting(0, &[MODE_STATIC, 0x00, 0xFF, 0x00, 0x08, 0])
+        d.set_lighting(0, 0, &[MODE_STATIC, 0x00, 0xFF, 0x00, 0x08, 0])
             .await
             .unwrap();
 
@@ -1116,7 +1116,7 @@ mod tests {
         assert_eq!(sent[4][1], CMD_LED_EFFECT_START);
 
         // get_lighting reflects the last set.
-        assert_eq!(d.get_lighting(0).await.unwrap()[2], 0xFF);
+        assert_eq!(d.get_lighting(0, 0).await.unwrap()[2], 0xFF);
     }
 
     #[tokio::test]
@@ -1124,7 +1124,7 @@ mod tests {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
         // 0x14 is just past the effect range and is not the 0x80 off mode.
-        let err = d.set_lighting(0, &[0x14, 0, 0, 0]).await.unwrap_err();
+        let err = d.set_lighting(0, 0, &[0x14, 0, 0, 0]).await.unwrap_err();
         assert!(matches!(err, DriverError::ProtocolViolation { .. }));
         assert!(io.sent().is_empty());
     }
@@ -1134,7 +1134,7 @@ mod tests {
         let io = Arc::new(MockIo::failing());
         let mut d = driver_with(io.clone());
         assert!(matches!(
-            d.set_lighting(0, &[MODE_STATIC, 0xFF, 0, 0]).await,
+            d.set_lighting(0, 0, &[MODE_STATIC, 0xFF, 0, 0]).await,
             Err(DriverError::Disconnected)
         ));
     }

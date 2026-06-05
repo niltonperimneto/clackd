@@ -1296,6 +1296,7 @@ mod tests {
         let (worker_tx, _) = mpsc::channel(1);
         let handle = DeviceHandle {
             topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            model: "test-model".to_string(),
             tx: worker_tx,
             vendor_id: 0,
             product_id: 0,
@@ -1342,6 +1343,7 @@ mod tests {
         let (worker_tx, _) = mpsc::channel(1);
         let handle = DeviceHandle {
             topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            model: "test-model".to_string(),
             tx: worker_tx,
             vendor_id: 0,
             product_id: 0,
