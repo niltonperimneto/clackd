@@ -30,13 +30,19 @@
 //!
 //! # Reconnection Policy
 //!
-//! Per CLAUDE.md §1.4, the supervisor "must attempt reconnection with
-//! exponential backoff before declaring a device permanently offline".
-//! For Mission 2, fatal worker errors evict immediately — the reconnection
-//! loop is a TODO(mission-3) item that lands alongside the first concrete
-//! driver, when "transient bus error" gains an operational definition.
-//! Physical re-plug events are already handled correctly: udev emits a
-//! fresh `DeviceConnected`, and the supervisor attaches a new worker.
+//! Per CLAUDE.md §1.4, the supervisor attempts reconnection with exponential
+//! backoff (see [`reconnect_task`]) before declaring a device permanently
+//! offline. Two triggers arm the same loop via [`schedule_reconnect`]: a
+//! running worker that retired under [`DriverError::Disconnected`], and an
+//! *initial attach* that failed transiently ([`is_retriable_attach_error`]).
+//! The latter is what keeps the cold-boot `uaccess` race from stranding a
+//! device: at boot the daemon can `open(2)` a hidraw node before
+//! `systemd-logind` has applied the session ACL, yielding `EACCES`; without a
+//! retry the device would sit unmanaged until the next udev event (logind's
+//! ACL application emits none the monitor reacts to). Permanent failures —
+//! e.g. a non-VIA node rejected by descriptor probe — are not retried.
+//! Physical re-plug is handled separately: udev emits a fresh
+//! `DeviceConnected`, and the supervisor attaches a new worker.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -469,10 +475,26 @@ async fn handle_command(
                             registry.devices.insert(device_id.clone(), handle);
                             let _ = lifecycle_tx.send(LifecycleEvent::DeviceAdded(device_id));
                         }
+                        Err(e) if is_retriable_attach_error(&e) => {
+                            warn!(device_id, error = %e, "initial attach failed transiently — scheduling backoff retry");
+                            schedule_reconnect(
+                                registry,
+                                ReconnectTarget { device_id, vendor_id, product_id, hidraw_path },
+                                driver_table, engine_tx, lifecycle_tx,
+                            );
+                        }
                         Err(e) => {
                             error!(device_id, error = %e, "device attach failed");
                         }
                     }
+                }
+                Err(e) if is_retriable_attach_error(&e) => {
+                    warn!(device_id, error = %e, "driver init failed transiently — scheduling backoff retry");
+                    schedule_reconnect(
+                        registry,
+                        ReconnectTarget { device_id, vendor_id, product_id, hidraw_path },
+                        driver_table, engine_tx, lifecycle_tx,
+                    );
                 }
                 Err(e) => {
                     error!(device_id, error = %e, "driver initialization failed");
@@ -496,23 +518,16 @@ async fn handle_command(
                 let _ = lifecycle_tx.send(LifecycleEvent::DeviceRemoved(device_id.clone()));
                 if let DaemonError::Driver(DriverError::Disconnected) = *e {
                     info!(device_id, "device disconnected, starting reconnection backoff");
-                    let (cancel_tx, cancel_rx) = oneshot::channel();
-                    let token = registry.next_reconnect_token;
-                    registry.next_reconnect_token = registry.next_reconnect_token.wrapping_add(1);
-                    registry.reconnecting.insert(device_id.clone(), (cancel_tx, token));
-                    tokio::spawn(reconnect_task(
-                        ReconnectCtx {
+                    schedule_reconnect(
+                        registry,
+                        ReconnectTarget {
                             device_id,
                             vendor_id: handle.vendor_id,
                             product_id: handle.product_id,
                             hidraw_path: handle.hidraw_path,
-                            driver_table: driver_table.clone(),
-                            engine_tx: engine_tx.clone(),
-                            lifecycle_tx: lifecycle_tx.clone(),
-                            token,
                         },
-                        cancel_rx,
-                    ));
+                        driver_table, engine_tx, lifecycle_tx,
+                    );
                 }
             }
         }
@@ -979,6 +994,70 @@ fn is_fatal_driver_error<T>(result: &Result<T, DaemonError>) -> bool {
     )
 }
 
+/// Classifies an *attach-time* failure as one worth retrying with backoff.
+///
+/// **Context:** Distinct from [`is_fatal_driver_error`], which decides whether
+/// a *running* worker retires. At attach time `PermissionDenied` is usually
+/// transient, not terminal: on a cold boot the daemon can open a hidraw node
+/// before `systemd-logind` has applied the `uaccess` ACL (CLAUDE.md §6), so
+/// `open(2)` returns `EACCES` for a device that becomes accessible a fraction
+/// of a second later. Retrying with bounded backoff lets the device attach as
+/// soon as the ACL lands instead of being dropped until the next udev event.
+/// `Disconnected` covers a node that briefly vanished mid-enumeration. Every
+/// other class — notably `ProtocolViolation` for a node whose descriptor probe
+/// rejects it as non-VIA — is permanent and must **not** spin.
+fn is_retriable_attach_error(error: &DaemonError) -> bool {
+    matches!(
+        error,
+        DaemonError::Driver(DriverError::Disconnected | DriverError::PermissionDenied { .. })
+    )
+}
+
+/// Identity needed to (re)open a device on a backoff retry.
+struct ReconnectTarget {
+    device_id: String,
+    vendor_id: u16,
+    product_id: u16,
+    hidraw_path: std::path::PathBuf,
+}
+
+/// Arms a bounded-backoff (re)connection task for a device and records its
+/// cancellation handle + a fresh token in the registry.
+///
+/// **Context:** Shared by the two triggers that both want the same backoff
+/// loop: a *running* worker that retired under [`DriverError::Disconnected`],
+/// and an *initial* attach that failed transiently (see
+/// [`is_retriable_attach_error`] — most importantly the cold-boot `uaccess`
+/// race). The token guards against a stale task's `DeviceReattached` racing a
+/// newer attach (see the [`EngineCommand::DeviceReattached`] handler).
+fn schedule_reconnect(
+    registry: &mut DeviceRegistry,
+    target: ReconnectTarget,
+    driver_table: &std::sync::Arc<DriverTable>,
+    engine_tx: &mpsc::Sender<EngineCommand>,
+    lifecycle_tx: &broadcast::Sender<LifecycleEvent>,
+) {
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let token = registry.next_reconnect_token;
+    registry.next_reconnect_token = registry.next_reconnect_token.wrapping_add(1);
+    registry
+        .reconnecting
+        .insert(target.device_id.clone(), (cancel_tx, token));
+    tokio::spawn(reconnect_task(
+        ReconnectCtx {
+            device_id: target.device_id,
+            vendor_id: target.vendor_id,
+            product_id: target.product_id,
+            hidraw_path: target.hidraw_path,
+            driver_table: driver_table.clone(),
+            engine_tx: engine_tx.clone(),
+            lifecycle_tx: lifecycle_tx.clone(),
+            token,
+        },
+        cancel_rx,
+    ));
+}
+
 /// Bundles the shared context needed by the reconnection loop.
 ///
 /// **Context:** Exists solely to avoid exceeding clippy's 7-argument limit
@@ -1052,7 +1131,7 @@ async fn reconnect_task(
                         return;
                     }
                     Err(e) => {
-                        if !matches!(e, DaemonError::Driver(DriverError::Disconnected)) {
+                        if !is_retriable_attach_error(&e) {
                             info!(ctx.device_id, error = %e, "non-retriable error during attach — aborting reconnection");
                             break;
                         }
@@ -1060,7 +1139,7 @@ async fn reconnect_task(
                 }
             }
             Err(e) => {
-                if !matches!(e, DaemonError::Driver(DriverError::Disconnected)) {
+                if !is_retriable_attach_error(&e) {
                     info!(ctx.device_id, error = %e, "non-retriable error during driver init — aborting reconnection");
                     break;
                 }
@@ -1361,5 +1440,95 @@ mod tests {
 
         // Verify it was ignored.
         assert!(registry.devices.is_empty());
+    }
+
+    // ---- initial-attach retry (cold-boot uaccess race) ----
+
+    /// Factory that always fails as if `open(2)` hit `EACCES` — models a
+    /// hidraw node whose `uaccess` ACL has not been applied yet at boot.
+    fn perm_denied_factory(_: &std::path::Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
+        Err(DaemonError::Driver(DriverError::PermissionDenied { path: PathBuf::new() }))
+    }
+
+    /// Factory that fails as a non-VIA node would — a permanent rejection.
+    fn proto_violation_factory(_: &std::path::Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
+        Err(DaemonError::Driver(DriverError::ProtocolViolation { reason: "not the vendor interface" }))
+    }
+
+    fn driver_table_with(vid: u16, pid: u16, factory: DriverFactory) -> std::sync::Arc<DriverTable> {
+        let mut dt = DriverTable::default();
+        dt.by_vid_pid.insert((vid, pid), factory);
+        std::sync::Arc::new(dt)
+    }
+
+    #[test]
+    fn retriable_attach_error_classification() {
+        // Transient at attach time → retry with backoff.
+        assert!(is_retriable_attach_error(&DaemonError::Driver(DriverError::Disconnected)));
+        assert!(is_retriable_attach_error(&DaemonError::Driver(
+            DriverError::PermissionDenied { path: PathBuf::new() }
+        )));
+        // Permanent → must not spin.
+        assert!(!is_retriable_attach_error(&DaemonError::Driver(
+            DriverError::ProtocolViolation { reason: "x" }
+        )));
+        assert!(!is_retriable_attach_error(&DaemonError::Driver(DriverError::Io(
+            std::io::Error::other("x")
+        ))));
+        assert!(!is_retriable_attach_error(&DaemonError::DeviceNotFound { device_id: "d".into() }));
+    }
+
+    #[tokio::test]
+    async fn initial_attach_permission_denied_schedules_backoff_retry() {
+        // The cold-boot race: the daemon opens the node before logind applies
+        // the uaccess ACL, so the factory fails with EACCES. The device must be
+        // queued for a backoff retry, not dropped until the next udev event.
+        let mut registry = DeviceRegistry::new();
+        // Keep the receiver alive so the spawned retry task's sender is valid.
+        let (tx, _rx) = mpsc::channel(8);
+        let dt = driver_table_with(0x05ac, 0x024f, perm_denied_factory);
+        let (lt, _) = broadcast::channel(LIFECYCLE_CHANNEL_CAPACITY);
+
+        handle_command(
+            EngineCommand::DeviceConnected {
+                device_id: "hidraw3".into(),
+                vendor_id: 0x05ac,
+                product_id: 0x024f,
+                hidraw_path: PathBuf::from("/dev/hidraw3"),
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        assert!(registry.devices.is_empty(), "must not attach while EACCES");
+        assert!(
+            registry.reconnecting.contains_key("hidraw3"),
+            "transient EACCES at boot must arm a backoff retry",
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_attach_protocol_violation_drops_without_retry() {
+        // A non-VIA node rejected by the descriptor probe is a permanent
+        // failure — it must be dropped, never retried in a spin.
+        let mut registry = DeviceRegistry::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let dt = driver_table_with(0x1234, 0x5678, proto_violation_factory);
+        let (lt, _) = broadcast::channel(LIFECYCLE_CHANNEL_CAPACITY);
+
+        handle_command(
+            EngineCommand::DeviceConnected {
+                device_id: "hidraw0".into(),
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                hidraw_path: PathBuf::from("/dev/hidraw0"),
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        assert!(registry.devices.is_empty());
+        assert!(
+            !registry.reconnecting.contains_key("hidraw0"),
+            "permanent failure must not arm a retry",
+        );
     }
 }
