@@ -293,8 +293,33 @@ pub trait KeyboardDriver: Send + Sync {
     /// Extended Configuration (VIA protocol specific mappings)
     async fn get_macro_buffer(&mut self, offset: u16, length: u8) -> Result<Vec<u8>, DriverError>;
     async fn set_macro_buffer(&mut self, offset: u16, data: &[u8]) -> Result<(), DriverError>;
-    async fn get_lighting(&mut self, lighting_cmd: u8) -> Result<Vec<u8>, DriverError>;
-    async fn set_lighting(&mut self, lighting_cmd: u8, data: &[u8]) -> Result<(), DriverError>;
+
+    /// Reads a VIA "custom value" — a `(channel, value_id)` pair.
+    ///
+    /// **Context:** Maps to `id_custom_get_value` (VIA `0x08`). `channel`
+    /// selects the lighting subsystem (e.g. QMK RGB-matrix = `3`,
+    /// RGBLIGHT/underglow = `2`, backlight = `1`); `value_id` selects the
+    /// field within it (e.g. RGB-matrix brightness = `1`, effect = `2`,
+    /// speed = `3`, colour = `4`). Returns the firmware's value bytes
+    /// (the portion after the echoed `channel`/`value_id`); the caller
+    /// interprets the length per the value's type (1 byte for brightness,
+    /// 2 bytes hue+sat for colour, …).
+    async fn get_lighting(&mut self, channel: u8, value_id: u8) -> Result<Vec<u8>, DriverError>;
+
+    /// Writes a VIA "custom value" — a `(channel, value_id)` pair.
+    ///
+    /// **Context:** Maps to `id_custom_set_value` (VIA `0x07`). The write
+    /// applies live; persistence to EEPROM is a separate `id_custom_save`
+    /// (not issued here — `commit_to_nvram` does not currently persist
+    /// custom values), so a set survives until the next power cycle unless
+    /// explicitly saved. `data` carries the value bytes for the
+    /// `(channel, value_id)`.
+    async fn set_lighting(
+        &mut self,
+        channel: u8,
+        value_id: u8,
+        data: &[u8],
+    ) -> Result<(), DriverError>;
 
     /// Forces durability of any pending writes.
     ///

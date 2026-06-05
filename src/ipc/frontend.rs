@@ -151,6 +151,31 @@ impl ClackdInterface {
         inner.map_err(zbus::fdo::Error::from)
     }
 
+    /// Returns the `(vendor_id, product_id, product_name)` USB identity of a device.
+    ///
+    /// **Context:** Cached at attach time; no hardware round-trip. Lets a
+    /// frontend match the device against an external layout definition keyed on
+    /// `vid:pid` (e.g. a VIA/KLE definition). `product_name` is best-effort and
+    /// may be empty.
+    ///
+    /// # Errors
+    /// - `UnknownObject` if no device is registered under `device_id`.
+    /// - `Failed` for engine-channel failures.
+    async fn get_device_identity(&self, device_id: &str) -> zbus::fdo::Result<(u16, u16, String)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.engine_tx
+            .send(EngineCommand::GetDeviceIdentity {
+                device_id: device_id.to_owned(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("engine command channel closed".to_owned()))?;
+        let inner = reply_rx
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("engine reply channel dropped".to_owned()))?;
+        inner.map_err(zbus::fdo::Error::from)
+    }
+
     /// Forces a commit / NVRAM flush for a device.
     ///
     /// **Context:** No-op for unbuffered VIA; flushes the write-coalescing
@@ -209,13 +234,24 @@ impl ClackdInterface {
         inner.map_err(zbus::fdo::Error::from)
     }
 
-    /// Lighting/RGB configuration
-    async fn get_lighting(&self, device_id: &str, command: u8) -> zbus::fdo::Result<Vec<u8>> {
+    /// Reads a VIA custom value `(channel, value_id)` — RGB/backlight config.
+    ///
+    /// **Context:** `channel` is the VIA custom channel (QMK RGB-matrix = 3,
+    /// RGBLIGHT = 2, backlight = 1); `value_id` selects the field
+    /// (brightness = 1, effect = 2, speed = 3, colour = 4). Returns the
+    /// raw value bytes.
+    async fn get_lighting(
+        &self,
+        device_id: &str,
+        channel: u8,
+        value_id: u8,
+    ) -> zbus::fdo::Result<Vec<u8>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.engine_tx
             .send(EngineCommand::GetLighting {
                 device_id: device_id.to_owned(),
-                command,
+                channel,
+                value_id,
                 reply: reply_tx,
             })
             .await
@@ -226,12 +262,24 @@ impl ClackdInterface {
         inner.map_err(zbus::fdo::Error::from)
     }
 
-    async fn set_lighting(&self, device_id: &str, command: u8, data: Vec<u8>) -> zbus::fdo::Result<()> {
+    /// Writes a VIA custom value `(channel, value_id)` — RGB/backlight config.
+    ///
+    /// **Context:** Applies live; not persisted to EEPROM unless a separate
+    /// save is issued (not currently exposed). See [`Self::get_lighting`]
+    /// for the channel/value_id meanings.
+    async fn set_lighting(
+        &self,
+        device_id: &str,
+        channel: u8,
+        value_id: u8,
+        data: Vec<u8>,
+    ) -> zbus::fdo::Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.engine_tx
             .send(EngineCommand::SetLighting {
                 device_id: device_id.to_owned(),
-                command,
+                channel,
+                value_id,
                 data,
                 reply: reply_tx,
             })
@@ -358,6 +406,23 @@ mod tests {
 
         let result = iface.get_keycode("dev0", 0, 1, 2).await;
         assert_eq!(result.unwrap(), 0x004C);
+    }
+
+    #[tokio::test]
+    async fn get_device_identity_happy_path() {
+        let (engine_tx, mut engine_rx) = mpsc::channel(1);
+        let iface = ClackdInterface { engine_tx };
+
+        tokio::spawn(async move {
+            if let Some(EngineCommand::GetDeviceIdentity { reply, .. }) = engine_rx.recv().await {
+                let _ = reply.send(Ok((0x1234, 0xabcd, "Test Board".to_owned())));
+            }
+        });
+
+        let (vid, pid, name) = iface.get_device_identity("dev0").await.unwrap();
+        assert_eq!(vid, 0x1234);
+        assert_eq!(pid, 0xabcd);
+        assert_eq!(name, "Test Board");
     }
 
     #[tokio::test]

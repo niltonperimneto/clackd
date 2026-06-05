@@ -667,10 +667,10 @@ impl KeyboardDriver for Gmk67Driver {
         Ok(())
     }
 
-    /// `command` is unused for the EK68; `data` is
+    /// `channel` and `value_id` are unused for the EK68; `data` is
     /// `[mode, r, g, b, brightness?, random?, speed?, direction?]`. The frame
     /// is rendered via the full transaction (not a single write).
-    async fn set_lighting(&mut self, _command: u8, data: &[u8]) -> Result<(), DriverError> {
+    async fn set_lighting(&mut self, _channel: u8, _value_id: u8, data: &[u8]) -> Result<(), DriverError> {
         let lighting = Lighting::from_bytes(data);
         if !is_renderable_mode(lighting.mode) {
             return Err(DriverError::ProtocolViolation {
@@ -687,7 +687,7 @@ impl KeyboardDriver for Gmk67Driver {
         Ok(())
     }
 
-    async fn get_lighting(&mut self, _command: u8) -> Result<Vec<u8>, DriverError> {
+    async fn get_lighting(&mut self, _channel: u8, _value_id: u8) -> Result<Vec<u8>, DriverError> {
         Ok(self.lighting.to_bytes())
     }
 

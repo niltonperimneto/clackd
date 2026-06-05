@@ -264,11 +264,13 @@ enum WorkerOp {
         reply: oneshot::Sender<Result<(), DaemonError>>,
     },
     GetLighting {
-        command: u8,
+        channel: u8,
+        value_id: u8,
         reply: oneshot::Sender<Result<Vec<u8>, DaemonError>>,
     },
     SetLighting {
-        command: u8,
+        channel: u8,
+        value_id: u8,
         data: Vec<u8>,
         reply: oneshot::Sender<Result<(), DaemonError>>,
     },
@@ -282,7 +284,7 @@ enum WorkerOp {
 /// [`EngineCommand::DeviceError`], and channel-closed detection on
 /// `try_send` covers the race where a worker dies between command dispatch
 /// and the next supervisor tick.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DeviceHandle {
     /// Dimensions reported by the device at attach time. Cached for the
     /// session per the cache-once-on-attach pattern documented on
@@ -306,7 +308,8 @@ pub(crate) struct DeviceHandle {
 #[derive(Default)]
 pub struct DeviceRegistry {
     devices: HashMap<String, DeviceHandle>,
-    reconnecting: HashMap<String, oneshot::Sender<()>>,
+    reconnecting: HashMap<String, (oneshot::Sender<()>, u64)>,
+    next_reconnect_token: u64,
 }
 
 impl DeviceRegistry {
@@ -421,11 +424,11 @@ async fn handle_command(
         EngineCommand::SetMacro { device_id, offset, data, reply } => {
             dispatch_macro_set(registry, device_id, offset, data, reply);
         }
-        EngineCommand::GetLighting { device_id, command, reply } => {
-            dispatch_lighting_get(registry, device_id, command, reply);
+        EngineCommand::GetLighting { device_id, channel, value_id, reply } => {
+            dispatch_lighting_get(registry, device_id, channel, value_id, reply);
         }
-        EngineCommand::SetLighting { device_id, command, data, reply } => {
-            dispatch_lighting_set(registry, device_id, command, data, reply);
+        EngineCommand::SetLighting { device_id, channel, value_id, data, reply } => {
+            dispatch_lighting_set(registry, device_id, channel, value_id, data, reply);
         }
         EngineCommand::DeviceConnected { device_id, vendor_id, product_id, hidraw_path } => {
             registry.reconnecting.remove(&device_id);
@@ -477,7 +480,7 @@ async fn handle_command(
             }
         }
         EngineCommand::DeviceDisconnected { device_id } => {
-            if let Some(cancel) = registry.reconnecting.remove(&device_id) {
+            if let Some((cancel, _token)) = registry.reconnecting.remove(&device_id) {
                 let _ = cancel.send(());
             }
             if registry.devices.remove(&device_id).is_some() {
@@ -494,7 +497,9 @@ async fn handle_command(
                 if let DaemonError::Driver(DriverError::Disconnected) = *e {
                     info!(device_id, "device disconnected, starting reconnection backoff");
                     let (cancel_tx, cancel_rx) = oneshot::channel();
-                    registry.reconnecting.insert(device_id.clone(), cancel_tx);
+                    let token = registry.next_reconnect_token;
+                    registry.next_reconnect_token = registry.next_reconnect_token.wrapping_add(1);
+                    registry.reconnecting.insert(device_id.clone(), (cancel_tx, token));
                     tokio::spawn(reconnect_task(
                         ReconnectCtx {
                             device_id,
@@ -504,23 +509,31 @@ async fn handle_command(
                             driver_table: driver_table.clone(),
                             engine_tx: engine_tx.clone(),
                             lifecycle_tx: lifecycle_tx.clone(),
+                            token,
                         },
                         cancel_rx,
                     ));
                 }
             }
         }
-        EngineCommand::DeviceReattached { device_id, handle } => {
-            registry.reconnecting.remove(&device_id);
-            info!(
-                device_id,
-                rows = handle.topology.matrix.rows,
-                cols = handle.topology.matrix.cols,
-                layers = handle.topology.layer_count,
-                "device reattached after backoff",
-            );
-            registry.devices.insert(device_id.clone(), handle);
-            let _ = lifecycle_tx.send(LifecycleEvent::DeviceAdded(device_id));
+        EngineCommand::DeviceReattached { device_id, handle, token } => {
+            match registry.reconnecting.get(&device_id) {
+                Some((_, current_token)) if *current_token == token => {
+                    registry.reconnecting.remove(&device_id);
+                    info!(
+                        device_id,
+                        rows = handle.topology.matrix.rows,
+                        cols = handle.topology.matrix.cols,
+                        layers = handle.topology.layer_count,
+                        "device reattached after backoff",
+                    );
+                    registry.devices.insert(device_id.clone(), handle);
+                    let _ = lifecycle_tx.send(LifecycleEvent::DeviceAdded(device_id));
+                }
+                _ => {
+                    debug!(device_id, expected_token = ?registry.reconnecting.get(&device_id).map(|t| t.1), actual_token = token, "DeviceReattached ignored (token mismatch or reconnect cancelled)");
+                }
+            }
         }
         EngineCommand::ListDevices { reply } => {
             let mut ids: Vec<String> = registry.devices.keys().cloned().collect();
@@ -535,6 +548,15 @@ async fn handle_command(
                     handle.topology.matrix.cols,
                     handle.topology.layer_count,
                 )),
+                None => Err(DaemonError::DeviceNotFound { device_id }),
+            };
+            let _ = reply.send(result);
+        }
+        EngineCommand::GetDeviceIdentity { device_id, reply } => {
+            let result = match registry.devices.get(&device_id) {
+                // product name is not yet captured at discovery; report empty
+                // and let the frontend fall back to its own labelling.
+                Some(handle) => Ok((handle.vendor_id, handle.product_id, String::new())),
                 None => Err(DaemonError::DeviceNotFound { device_id }),
             };
             let _ = reply.send(result);
@@ -645,14 +667,15 @@ fn dispatch_macro_set(
 fn dispatch_lighting_get(
     registry: &mut DeviceRegistry,
     device_id: String,
-    command: u8,
+    channel: u8,
+    value_id: u8,
     reply: oneshot::Sender<Result<Vec<u8>, DaemonError>>,
 ) {
     let Some(handle) = registry.devices.get(&device_id) else {
         let _ = reply.send(Err(DaemonError::DeviceNotFound { device_id }));
         return;
     };
-    let op = WorkerOp::GetLighting { command, reply };
+    let op = WorkerOp::GetLighting { channel, value_id, reply };
     if let Err(send_err) = handle.tx.try_send(op) {
         surface_worker_send_failure(send_err, &device_id, registry);
     }
@@ -661,7 +684,8 @@ fn dispatch_lighting_get(
 fn dispatch_lighting_set(
     registry: &mut DeviceRegistry,
     device_id: String,
-    command: u8,
+    channel: u8,
+    value_id: u8,
     data: Vec<u8>,
     reply: oneshot::Sender<Result<(), DaemonError>>,
 ) {
@@ -669,7 +693,7 @@ fn dispatch_lighting_set(
         let _ = reply.send(Err(DaemonError::DeviceNotFound { device_id }));
         return;
     };
-    let op = WorkerOp::SetLighting { command, data, reply };
+    let op = WorkerOp::SetLighting { channel, value_id, data, reply };
     if let Err(send_err) = handle.tx.try_send(op) {
         surface_worker_send_failure(send_err, &device_id, registry);
     }
@@ -883,18 +907,18 @@ async fn run_device_worker(
                         let _ = reply.send(result);
                         is_fatal
                     }
-                    WorkerOp::GetLighting { command, reply } => {
+                    WorkerOp::GetLighting { channel, value_id, reply } => {
                         let result = driver
-                            .get_lighting(command)
+                            .get_lighting(channel, value_id)
                             .await
                             .map_err(DaemonError::from);
                         let is_fatal = is_fatal_driver_error(&result);
                         let _ = reply.send(result);
                         is_fatal
                     }
-                    WorkerOp::SetLighting { command, data, reply } => {
+                    WorkerOp::SetLighting { channel, value_id, data, reply } => {
                         let result = driver
-                            .set_lighting(command, &data)
+                            .set_lighting(channel, value_id, &data)
                             .await
                             .map_err(DaemonError::from);
                         let is_fatal = is_fatal_driver_error(&result);
@@ -906,7 +930,7 @@ async fn run_device_worker(
 
             // Debounced compile-and-push for buffered drivers. The precondition
             // gates the branch, so `unwrap` runs only when a deadline is set.
-            _ = tokio::time::sleep_until(commit_deadline.unwrap()), if commit_deadline.is_some() => {
+            _ = tokio::time::sleep_until(commit_deadline.unwrap_or_else(|| tokio::time::Instant::now())), if commit_deadline.is_some() => {
                 commit_deadline = None;
                 let result = driver.commit_to_nvram().await.map_err(DaemonError::from);
                 let is_fatal = is_fatal_driver_error(&result);
@@ -968,6 +992,7 @@ struct ReconnectCtx {
     driver_table: std::sync::Arc<DriverTable>,
     engine_tx: mpsc::Sender<EngineCommand>,
     lifecycle_tx: broadcast::Sender<LifecycleEvent>,
+    token: u64,
 }
 
 async fn reconnect_task(
@@ -1014,7 +1039,16 @@ async fn reconnect_task(
                 .await
                 {
                     Ok(handle) => {
-                        let _ = ctx.engine_tx.send(EngineCommand::DeviceReattached { device_id: ctx.device_id, handle }).await;
+                        // Check if cancelled before sending
+                        if !matches!(cancel_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                            info!(ctx.device_id, "reconnection succeeded but task was cancelled — discarding handle");
+                            return;
+                        }
+                        let _ = ctx.engine_tx.send(EngineCommand::DeviceReattached {
+                            device_id: ctx.device_id,
+                            handle,
+                            token: ctx.token,
+                        }).await;
                         return;
                     }
                     Err(e) => {
@@ -1064,8 +1098,8 @@ mod tests {
         async fn commit_to_nvram(&mut self) -> Result<(), DriverError> { Ok(()) }
         async fn get_macro_buffer(&mut self, _offset: u16, length: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; length as usize]) }
         async fn set_macro_buffer(&mut self, _offset: u16, _data: &[u8]) -> Result<(), DriverError> { Ok(()) }
-        async fn get_lighting(&mut self, _lighting_cmd: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; 4]) }
-        async fn set_lighting(&mut self, _lighting_cmd: u8, _data: &[u8]) -> Result<(), DriverError> { Ok(()) }
+        async fn get_lighting(&mut self, _channel: u8, _value_id: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; 4]) }
+        async fn set_lighting(&mut self, _channel: u8, _value_id: u8, _data: &[u8]) -> Result<(), DriverError> { Ok(()) }
     }
 
     /// Buffered (legacy-style) driver: suppresses per-set events and counts
@@ -1086,8 +1120,8 @@ mod tests {
         }
         async fn get_macro_buffer(&mut self, _o: u16, length: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; length as usize]) }
         async fn set_macro_buffer(&mut self, _o: u16, _d: &[u8]) -> Result<(), DriverError> { Ok(()) }
-        async fn get_lighting(&mut self, _c: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; 4]) }
-        async fn set_lighting(&mut self, _c: u8, _d: &[u8]) -> Result<(), DriverError> { Ok(()) }
+        async fn get_lighting(&mut self, _channel: u8, _value_id: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; 4]) }
+        async fn set_lighting(&mut self, _channel: u8, _value_id: u8, _data: &[u8]) -> Result<(), DriverError> { Ok(()) }
         // Buffered/legacy: no per-set event; the worker debounces and commits.
         fn emits_layout_event_per_set(&self) -> bool { false }
     }
@@ -1247,5 +1281,83 @@ mod tests {
             &mut registry, &tx, &dt, &lt,
         ).await;
         assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reattach_token_matching() {
+        let mut registry = DeviceRegistry::new();
+        let (tx, dt, lt) = harness();
+
+        // 1. Setup a reconnect state with a token.
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        registry.reconnecting.insert("dev1".into(), (cancel_tx, 42));
+
+        // Create a dummy DeviceHandle to use for reattachment.
+        let (worker_tx, _) = mpsc::channel(1);
+        let handle = DeviceHandle {
+            topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            tx: worker_tx,
+            vendor_id: 0,
+            product_id: 0,
+            hidraw_path: PathBuf::new(),
+        };
+
+        // 2. Dispatch DeviceReattached with a mismatching token (e.g. 41).
+        handle_command(
+            EngineCommand::DeviceReattached {
+                device_id: "dev1".into(),
+                handle: handle.clone(),
+                token: 41,
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        // Verify it was ignored: device not added, and reconnect state is still present.
+        assert!(registry.devices.is_empty());
+        assert!(registry.reconnecting.contains_key("dev1"));
+        assert_eq!(registry.reconnecting.get("dev1").unwrap().1, 42);
+
+        // 3. Dispatch DeviceReattached with matching token (42).
+        handle_command(
+            EngineCommand::DeviceReattached {
+                device_id: "dev1".into(),
+                handle,
+                token: 42,
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        // Verify it succeeded: device added, reconnect state removed.
+        assert_eq!(registry.len(), 1);
+        assert!(registry.devices.contains_key("dev1"));
+        assert!(!registry.reconnecting.contains_key("dev1"));
+    }
+
+    #[tokio::test]
+    async fn test_reattach_without_reconnect_state() {
+        let mut registry = DeviceRegistry::new();
+        let (tx, dt, lt) = harness();
+
+        // DeviceReattached arrives but there is no entry in reconnecting.
+        let (worker_tx, _) = mpsc::channel(1);
+        let handle = DeviceHandle {
+            topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            tx: worker_tx,
+            vendor_id: 0,
+            product_id: 0,
+            hidraw_path: PathBuf::new(),
+        };
+
+        handle_command(
+            EngineCommand::DeviceReattached {
+                device_id: "dev1".into(),
+                handle,
+                token: 0,
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        // Verify it was ignored.
+        assert!(registry.devices.is_empty());
     }
 }
