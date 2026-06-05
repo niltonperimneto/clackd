@@ -273,6 +273,16 @@ impl ShadowState {
         self.lighting = lighting;
     }
 
+    /// Persists the current shadow (keymap + lighting) to JSON immediately.
+    ///
+    /// Lighting is pushed to hardware live (not via the keymap commit path), so
+    /// the driver calls this after a `set_lighting` to make the new lighting
+    /// survive a reboot without waiting for a subsequent keymap commit. The
+    /// write is atomic and errors are logged and swallowed.
+    pub fn persist_lighting(&self) {
+        self.save();
+    }
+
     // ── Commit lifecycle ─────────────────────────────────────────────────
 
     /// Phase 1 of commit: sets status to `Pending`.
@@ -590,5 +600,34 @@ mod tests {
         let l1: Vec<_> = s.layer_entries(1).collect();
         assert_eq!(l1.len(), 1);
         assert_eq!(l1[0], (0, 0, 6));
+    }
+
+    #[test]
+    fn persist_lighting_writes_json_without_keymap_commit() {
+        let dir = TempDir::new().unwrap();
+        let s = {
+            let mut s = shadow_with_tmpdir(&dir, "light.json");
+            s.set_lighting(LightingState {
+                mode: 0x07,
+                r: 1,
+                g: 2,
+                b: 3,
+                brightness: 5,
+                speed: 6,
+                direction: 1,
+                random: true,
+            });
+            s.persist_lighting();
+            s
+        };
+        // persist_lighting wrote the file without any keymap commit.
+        assert_eq!(s.status(), CacheStatus::Confirmed);
+        let contents = std::fs::read_to_string(dir.path().join("light.json")).unwrap();
+        let sf: ShadowFile = serde_json::from_str(&contents).unwrap();
+        let l = sf.lighting.expect("lighting persisted");
+        assert_eq!(l.mode, 0x07);
+        assert_eq!(l.brightness, 5);
+        assert!(l.random);
+        assert!(sf.keymap.is_empty());
     }
 }

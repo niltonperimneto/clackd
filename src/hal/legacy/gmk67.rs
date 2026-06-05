@@ -680,6 +680,9 @@ impl KeyboardDriver for Gmk67Driver {
         self.render_effect(lighting).await?;
         self.lighting = lighting;
         self.shadow.set_lighting(lighting.to_lighting_state());
+        // Lighting is live (not part of the keymap commit), so persist it now so
+        // it survives a reboot without waiting for a subsequent keymap commit.
+        self.shadow.persist_lighting();
         debug!(device_id = %self.device_id, mode = lighting.mode, "set EK68 lighting");
         Ok(())
     }

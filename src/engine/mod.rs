@@ -783,6 +783,11 @@ async fn attach_device(
 /// (see [`crate::hal::KeyboardDriver`] cancel-safety note). On terminal
 /// driver error the worker emits an [`EngineCommand::DeviceError`] back
 /// to the supervisor and exits its loop.
+/// Debounce window for the legacy compile-and-push. After the last `set_keycode`
+/// on a buffered (legacy/coalescing) driver, the worker waits this long with no
+/// further edits before flushing the shadow to hardware (README §4).
+const LEGACY_COMMIT_DEBOUNCE: tokio::time::Duration = tokio::time::Duration::from_millis(500);
+
 async fn run_device_worker(
     device_id: String,
     mut driver: Box<dyn KeyboardDriver>,
@@ -791,84 +796,133 @@ async fn run_device_worker(
     lifecycle_tx: broadcast::Sender<LifecycleEvent>,
 ) {
     debug!(device_id, "worker started");
-    while let Some(op) = rx.recv().await {
-        let fatal = match op {
-            WorkerOp::GetKeycode { layer, row, col, reply } => {
-                let result = driver
-                    .get_keycode(layer, row, col)
-                    .await
-                    .map_err(DaemonError::from);
-                let is_fatal = is_fatal_driver_error(&result);
-                let _ = reply.send(result);
-                is_fatal
-            }
-            WorkerOp::SetKeycode { layer, row, col, keycode, reply } => {
-                let result = driver
-                    .set_keycode(layer, row, col, keycode)
-                    .await
-                    .map_err(DaemonError::from);
-                let is_fatal = is_fatal_driver_error(&result);
-                let succeeded = result.is_ok();
-                let _ = reply.send(result);
-                if succeeded && driver.emits_layout_event_per_set() {
-                    // Unbuffered VIA persists every write immediately; the
-                    // layout has changed from any frontend's perspective.
-                    // Coalescing drivers suppress this — their actor emits
-                    // the event after a successful flush instead.
-                    let _ = lifecycle_tx.send(LifecycleEvent::LayoutUpdated(device_id.clone()));
+
+    // Debounce deadline for buffered (legacy/coalescing) drivers: when set, the
+    // worker auto-commits the shadow once edits settle (README §4). VIA's
+    // unbuffered path leaves this `None` and persists each write immediately.
+    let mut commit_deadline: Option<tokio::time::Instant> = None;
+
+    loop {
+        let fatal = tokio::select! {
+            biased;
+
+            maybe_op = rx.recv() => {
+                let Some(op) = maybe_op else {
+                    // All senders dropped: flush any pending debounced edit
+                    // before exiting so a just-set keycode is not lost.
+                    if commit_deadline.take().is_some() {
+                        if let Err(e) = driver.commit_to_nvram().await {
+                            warn!(device_id, error = %e, "final flush on worker shutdown failed");
+                        }
+                    }
+                    break;
+                };
+                match op {
+                    WorkerOp::GetKeycode { layer, row, col, reply } => {
+                        let result = driver
+                            .get_keycode(layer, row, col)
+                            .await
+                            .map_err(DaemonError::from);
+                        let is_fatal = is_fatal_driver_error(&result);
+                        let _ = reply.send(result);
+                        is_fatal
+                    }
+                    WorkerOp::SetKeycode { layer, row, col, keycode, reply } => {
+                        let result = driver
+                            .set_keycode(layer, row, col, keycode)
+                            .await
+                            .map_err(DaemonError::from);
+                        let is_fatal = is_fatal_driver_error(&result);
+                        let succeeded = result.is_ok();
+                        let _ = reply.send(result);
+                        if succeeded {
+                            if driver.emits_layout_event_per_set() {
+                                // Unbuffered VIA persists every write immediately;
+                                // the layout has changed for any frontend.
+                                let _ = lifecycle_tx
+                                    .send(LifecycleEvent::LayoutUpdated(device_id.clone()));
+                            } else {
+                                // Buffered/legacy: (re)arm the debounced
+                                // compile-and-push; it fires once edits settle.
+                                commit_deadline =
+                                    Some(tokio::time::Instant::now() + LEGACY_COMMIT_DEBOUNCE);
+                            }
+                        }
+                        is_fatal
+                    }
+                    WorkerOp::Commit { reply } => {
+                        // An explicit commit supersedes any pending debounce.
+                        commit_deadline = None;
+                        let result = driver.commit_to_nvram().await.map_err(DaemonError::from);
+                        let is_fatal = is_fatal_driver_error(&result);
+                        let succeeded = result.is_ok();
+                        let _ = reply.send(result);
+                        if succeeded {
+                            // A successful commit is a layout-affecting checkpoint
+                            // for every backend.
+                            let _ = lifecycle_tx
+                                .send(LifecycleEvent::LayoutUpdated(device_id.clone()));
+                        }
+                        is_fatal
+                    }
+                    WorkerOp::GetMacro { offset, length, reply } => {
+                        let result = driver
+                            .get_macro_buffer(offset, length)
+                            .await
+                            .map_err(DaemonError::from);
+                        let is_fatal = is_fatal_driver_error(&result);
+                        let _ = reply.send(result);
+                        is_fatal
+                    }
+                    WorkerOp::SetMacro { offset, data, reply } => {
+                        let result = driver
+                            .set_macro_buffer(offset, &data)
+                            .await
+                            .map_err(DaemonError::from);
+                        let is_fatal = is_fatal_driver_error(&result);
+                        let _ = reply.send(result);
+                        is_fatal
+                    }
+                    WorkerOp::GetLighting { command, reply } => {
+                        let result = driver
+                            .get_lighting(command)
+                            .await
+                            .map_err(DaemonError::from);
+                        let is_fatal = is_fatal_driver_error(&result);
+                        let _ = reply.send(result);
+                        is_fatal
+                    }
+                    WorkerOp::SetLighting { command, data, reply } => {
+                        let result = driver
+                            .set_lighting(command, &data)
+                            .await
+                            .map_err(DaemonError::from);
+                        let is_fatal = is_fatal_driver_error(&result);
+                        let _ = reply.send(result);
+                        is_fatal
+                    }
                 }
-                is_fatal
             }
-            WorkerOp::Commit { reply } => {
+
+            // Debounced compile-and-push for buffered drivers. The precondition
+            // gates the branch, so `unwrap` runs only when a deadline is set.
+            _ = tokio::time::sleep_until(commit_deadline.unwrap()), if commit_deadline.is_some() => {
+                commit_deadline = None;
                 let result = driver.commit_to_nvram().await.map_err(DaemonError::from);
                 let is_fatal = is_fatal_driver_error(&result);
-                let succeeded = result.is_ok();
-                let _ = reply.send(result);
-                if succeeded && driver.emits_layout_event_per_set() {
-                    // Same gating as SetKeycode: for coalescing drivers the
-                    // actor emits LayoutUpdated when the flush triggered by
-                    // this commit completes, so the worker must not double-emit.
-                    let _ = lifecycle_tx.send(LifecycleEvent::LayoutUpdated(device_id.clone()));
+                match result {
+                    Ok(()) => {
+                        let _ = lifecycle_tx
+                            .send(LifecycleEvent::LayoutUpdated(device_id.clone()));
+                    }
+                    Err(e) => {
+                        warn!(device_id, error = %e, "debounced legacy commit failed");
+                    }
                 }
-                is_fatal
-            }
-            WorkerOp::GetMacro { offset, length, reply } => {
-                let result = driver
-                    .get_macro_buffer(offset, length)
-                    .await
-                    .map_err(DaemonError::from);
-                let is_fatal = is_fatal_driver_error(&result);
-                let _ = reply.send(result);
-                is_fatal
-            }
-            WorkerOp::SetMacro { offset, data, reply } => {
-                let result = driver
-                    .set_macro_buffer(offset, &data)
-                    .await
-                    .map_err(DaemonError::from);
-                let is_fatal = is_fatal_driver_error(&result);
-                let _ = reply.send(result);
-                is_fatal
-            }
-            WorkerOp::GetLighting { command, reply } => {
-                let result = driver
-                    .get_lighting(command)
-                    .await
-                    .map_err(DaemonError::from);
-                let is_fatal = is_fatal_driver_error(&result);
-                let _ = reply.send(result);
-                is_fatal
-            }
-            WorkerOp::SetLighting { command, data, reply } => {
-                let result = driver
-                    .set_lighting(command, &data)
-                    .await
-                    .map_err(DaemonError::from);
-                let is_fatal = is_fatal_driver_error(&result);
-                let _ = reply.send(result);
                 is_fatal
             }
         };
+
         if fatal {
             // Best-effort notify; if the engine has already shut down the
             // send fails silently and we exit anyway.
@@ -987,6 +1041,8 @@ async fn reconnect_task(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::sync::Mutex;
     use async_trait::async_trait;
 
@@ -1010,6 +1066,107 @@ mod tests {
         async fn set_macro_buffer(&mut self, _offset: u16, _data: &[u8]) -> Result<(), DriverError> { Ok(()) }
         async fn get_lighting(&mut self, _lighting_cmd: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; 4]) }
         async fn set_lighting(&mut self, _lighting_cmd: u8, _data: &[u8]) -> Result<(), DriverError> { Ok(()) }
+    }
+
+    /// Buffered (legacy-style) driver: suppresses per-set events and counts
+    /// `commit_to_nvram` calls, for exercising the worker's debounce.
+    struct CountingDriver {
+        commits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl KeyboardDriver for CountingDriver {
+        async fn get_matrix_dimensions(&mut self) -> Result<(u8, u8), DriverError> { Ok((5, 15)) }
+        async fn get_layer_count(&mut self) -> Result<u8, DriverError> { Ok(2) }
+        async fn get_keycode(&mut self, _l: u8, _r: u8, _c: u8) -> Result<u16, DriverError> { Ok(0) }
+        async fn set_keycode(&mut self, _l: u8, _r: u8, _c: u8, _k: u16) -> Result<(), DriverError> { Ok(()) }
+        async fn commit_to_nvram(&mut self) -> Result<(), DriverError> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn get_macro_buffer(&mut self, _o: u16, length: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; length as usize]) }
+        async fn set_macro_buffer(&mut self, _o: u16, _d: &[u8]) -> Result<(), DriverError> { Ok(()) }
+        async fn get_lighting(&mut self, _c: u8) -> Result<Vec<u8>, DriverError> { Ok(vec![0; 4]) }
+        async fn set_lighting(&mut self, _c: u8, _d: &[u8]) -> Result<(), DriverError> { Ok(()) }
+        // Buffered/legacy: no per-set event; the worker debounces and commits.
+        fn emits_layout_event_per_set(&self) -> bool { false }
+    }
+
+    /// Spawns a worker over a `CountingDriver`. Returns its op sender, the commit
+    /// counter, and a lifecycle receiver (created before spawn so it sees events).
+    fn spawn_counting_worker() -> (
+        mpsc::Sender<WorkerOp>,
+        Arc<AtomicUsize>,
+        broadcast::Receiver<LifecycleEvent>,
+    ) {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let driver = Box::new(CountingDriver { commits: commits.clone() });
+        let (op_tx, op_rx) = mpsc::channel(8);
+        let (eng_tx, eng_rx) = mpsc::channel(8);
+        // Keep the engine receiver alive for the worker's lifetime.
+        std::mem::forget(eng_rx);
+        let (life_tx, life_rx) = broadcast::channel(16);
+        tokio::spawn(run_device_worker("dev".into(), driver, op_rx, eng_tx, life_tx));
+        (op_tx, commits, life_rx)
+    }
+
+    async fn send_set(op_tx: &mpsc::Sender<WorkerOp>, keycode: u16) {
+        let (reply, rr) = oneshot::channel();
+        op_tx
+            .send(WorkerOp::SetKeycode { layer: 0, row: 0, col: 0, keycode, reply })
+            .await
+            .unwrap();
+        rr.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_set_debounces_then_commits_once() {
+        let (op_tx, commits, mut life_rx) = spawn_counting_worker();
+
+        send_set(&op_tx, 0x0004).await;
+        assert_eq!(commits.load(Ordering::SeqCst), 0, "no commit before the debounce window");
+
+        // Advance past the window; awaiting the event synchronizes on the flush.
+        tokio::time::advance(LEGACY_COMMIT_DEBOUNCE + std::time::Duration::from_millis(1)).await;
+        assert!(matches!(life_rx.recv().await.unwrap(), LifecycleEvent::LayoutUpdated(_)));
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_repeated_sets_coalesce_to_one_commit() {
+        let (op_tx, commits, mut life_rx) = spawn_counting_worker();
+
+        // Three edits, each well within the window, re-arming the timer.
+        for kc in [0x0004u16, 0x0005, 0x0006] {
+            send_set(&op_tx, kc).await;
+            tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(commits.load(Ordering::SeqCst), 0, "still within the re-armed window");
+
+        // Settle past the window since the last edit.
+        tokio::time::advance(LEGACY_COMMIT_DEBOUNCE).await;
+        let _ = life_rx.recv().await.unwrap();
+        assert_eq!(commits.load(Ordering::SeqCst), 1, "coalesced to a single commit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_explicit_commit_cancels_pending_debounce() {
+        let (op_tx, commits, mut life_rx) = spawn_counting_worker();
+
+        send_set(&op_tx, 0x0004).await; // arms the debounce
+
+        // Explicit commit flushes immediately and clears the timer.
+        let (reply, rr) = oneshot::channel();
+        op_tx.send(WorkerOp::Commit { reply }).await.unwrap();
+        rr.await.unwrap().unwrap();
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert!(matches!(life_rx.recv().await.unwrap(), LifecycleEvent::LayoutUpdated(_)));
+
+        // The cancelled debounce must not fire a second commit.
+        tokio::time::advance(LEGACY_COMMIT_DEBOUNCE + std::time::Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(commits.load(Ordering::SeqCst), 1, "debounce cancelled by explicit commit");
+        assert!(life_rx.try_recv().is_err(), "no second event");
     }
 
     /// Test-only harness: returns the four parameters every `handle_command`

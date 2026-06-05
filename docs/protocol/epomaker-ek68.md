@@ -150,9 +150,35 @@ Byte 0 of the mode frame:
 Special modes: `0x20` Direct (per-key, volatile), `0x23` Custom (per-key,
 saved), `0x80` Lights-off.
 
-Color (bytes 1–3) applies only to modes that carry a mode-specific color; Random
-colors, Spectrum cycle, and Lights-off ignore it. Direction (byte 11) applies
-only to the gradient, sequence, and back-and-forth modes.
+Per-effect parameter support (from the GMK67 source mode flags). "Dir" is the
+direction axis the mode uses: LR = left/right, UD = up/down. Every effect
+supports brightness and the random-color flag.
+
+| ID | Mode | Color | Speed | Dir | Random |
+|---|---|:--:|:--:|:--:|:--:|
+| `0x01` | Static | yes | — | — | yes |
+| `0x02` | Keystroke light-up | yes | yes | — | yes |
+| `0x03` | Keystroke dim | yes | yes | — | yes |
+| `0x04` | Sparkle | yes | yes | — | yes |
+| `0x05` | Rain | yes | yes | — | yes |
+| `0x06` | Random colors | — | yes | — | yes |
+| `0x07` | Breathing | yes | yes | — | yes |
+| `0x08` | Spectrum cycle | — | yes | — | yes |
+| `0x09` | Ring gradient | yes | yes | — | yes |
+| `0x0A` | Vertical gradient | yes | yes | UD | yes |
+| `0x0B` | Horizontal gradient / rainbow wave | yes | yes | LR | yes |
+| `0x0C` | Around edges | yes | yes | — | yes |
+| `0x0D` | Keystroke horizontal lines | yes | yes | — | yes |
+| `0x0E` | Keystroke tilted lines | yes | yes | — | yes |
+| `0x0F` | Keystroke ripples | yes | yes | — | yes |
+| `0x10` | Sequence | yes | yes | LR | yes |
+| `0x11` | Wave line | yes | yes | — | yes |
+| `0x12` | Tilted lines | yes | yes | — | yes |
+| `0x13` | Back-and-forth | yes | yes | LR | yes |
+
+Color (bytes 1–3) is honored only by modes marked "Color" — Random colors,
+Spectrum cycle, and Lights-off ignore it. Speed is ignored by Static. Direction
+(byte 11) applies only to the four modes with a "Dir" axis.
 
 ### 4.2 Mode frame
 
@@ -206,6 +232,48 @@ Send  04 02                 End communication
 
 **Custom mode (`0x23`)** is the saved equivalent: customization-on, then the
 `0x23` header and framebuffer, then end-communication and effect-start.
+
+### 4.5 Effect parameters — implementation status and open work
+
+The mode frame (section 4.2) already carries every effect parameter, and the
+driver writes all of them, so any effect in the table can be selected today with
+a color, brightness, speed, random flag, and a direction byte. What remains is
+characterizing two byte encodings and exposing the per-mode capabilities to
+callers. By parameter:
+
+- **Mode ID (byte 0)** — all 19 effects plus Lights-off (`0x80`) are confirmed
+  (section 4.1). Done.
+- **Color (bytes 1–3)** — confirmed. Done. Per-mode applicability is in the
+  table above; sending a color to a non-color mode is simply ignored by the
+  firmware.
+- **Brightness (byte 9), range `0x00`–`0x0F`** — confirmed on hardware. Done.
+- **Random-color flag (byte 8)** — confirmed present. Open: confirm its exact
+  effect per mode (for modes that have both a specific color and random, it is
+  expected to switch between the fixed color and a cycling/rainbow palette);
+  worth a quick on/off capture to document the behavior precisely.
+- **Speed (byte 10), range `0x00`–`0x0F`** — range confirmed. Open: the scale
+  direction is not characterized (is `0x00` slowest or fastest, and is it linear
+  or stepped?). Resolve by stepping speed on one effect and observing.
+- **Direction (byte 11)** — Open and the main gap. We know which modes use it
+  and on which axis (LR: `0x0B`, `0x10`, `0x13`; UD: `0x0A`), but the byte
+  **values are not decoded**. Needed: a capture of the official app toggling
+  direction on Horizontal gradient (`0x0B`, LR) and Vertical gradient (`0x0A`,
+  UD) to learn the encoding (likely `0`/`1`, possibly a small set). Until then
+  the driver passes the caller's raw byte through unvalidated.
+
+clackd work still to do for effects:
+
+1. **Expose the capability matrix** so a frontend offers only the parameters a
+   mode supports (e.g. no speed slider for Static, no color picker for Spectrum
+   cycle). The driver currently accepts a raw `[mode, r, g, b, brightness,
+   random, speed, direction]` array with no per-mode awareness.
+2. **Decode and then validate `direction`** (above), mapping a logical
+   left/right/up/down to the confirmed byte values per mode.
+3. **Optional:** a friendly `clackctl` effect interface (named mode + named
+   parameters) instead of the raw byte array.
+
+(Per-key Direct/Custom modes `0x20`/`0x23` are tracked separately in section 10,
+not here — they are a different code path from the effect modes above.)
 
 ---
 

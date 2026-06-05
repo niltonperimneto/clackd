@@ -266,9 +266,11 @@ pub trait KeyboardDriver: Send + Sync {
     ///   in-memory buffer and arms a flush timer (default 250 ms). The
     ///   actual hidraw write is deferred to [`Self::commit_to_nvram`] or
     ///   to the timer firing.
-    /// - Legacy: updates the shadow struct, flags it dirty, and arms the
-    ///   500 ms debounce timer described in CLAUDE.md §4.2. The compiled
-    ///   blob is pushed only when the timer expires undisturbed.
+    /// - Legacy: updates the shadow struct and flags it dirty. The engine
+    ///   worker then (re)arms a 500 ms debounce timer on the driver's behalf —
+    ///   the driver is synchronous within its actor and cannot self-schedule —
+    ///   and the compiled blob is pushed when the timer expires undisturbed, or
+    ///   immediately on [`Self::commit_to_nvram`]. See README §4.
     ///
     /// **Hardware Quirk (EEPROM):** Reproduced from the module doc — the
     /// reference ATmega32U4 part is rated for ~100,000 write cycles per
