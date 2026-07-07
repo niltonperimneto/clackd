@@ -61,15 +61,31 @@ pub async fn run_ipc(
     lifecycle_rx: broadcast::Receiver<LifecycleEvent>,
     ready: oneshot::Sender<()>,
 ) -> zbus::Result<()> {
+    run_ipc_with_name(CLACKD_BUS_NAME, engine_tx, lifecycle_rx, ready).await
+}
+
+/// [`run_ipc`] with the bus name as a parameter.
+///
+/// **Context:** Split out so tests can exercise the connection/handshake
+/// path under a unique per-process name. Requesting `CLACKD_BUS_NAME`
+/// itself from a test steals the name from any daemon instance running on
+/// the same session bus — the daemon does not re-acquire a lost name, so
+/// its interface would stay dead until a service restart.
+async fn run_ipc_with_name(
+    bus_name: &str,
+    engine_tx: mpsc::Sender<EngineCommand>,
+    lifecycle_rx: broadcast::Receiver<LifecycleEvent>,
+    ready: oneshot::Sender<()>,
+) -> zbus::Result<()> {
     let interface = frontend::ClackdInterface { engine_tx };
 
     let connection = zbus::connection::Builder::session()?
-        .name(CLACKD_BUS_NAME)?
+        .name(bus_name)?
         .serve_at(CLACKD_OBJECT_PATH, interface)?
         .build()
         .await?;
 
-    info!(bus = CLACKD_BUS_NAME, path = CLACKD_OBJECT_PATH, "IPC frontend ready");
+    info!(bus = bus_name, path = CLACKD_OBJECT_PATH, "IPC frontend ready");
 
     // Notify the boot path that the bus name is owned and the object
     // server is up. main.rs uses this to gate the systemd READY=1
@@ -146,7 +162,12 @@ mod tests {
         let (_, lifecycle_rx) = broadcast::channel(1);
         let (ready_tx, ready_rx) = oneshot::channel();
 
-        let ipc_task = tokio::spawn(run_ipc(engine_tx, lifecycle_rx, ready_tx));
+        // A unique per-process name: requesting the real CLACKD_BUS_NAME
+        // would steal it from a daemon running on the same session bus.
+        let test_name = format!("io.github.clackd.test{}", std::process::id());
+        let ipc_task = tokio::spawn(async move {
+            run_ipc_with_name(&test_name, engine_tx, lifecycle_rx, ready_tx).await
+        });
 
         // The IPC task will either succeed in connecting to the session bus and send(),
         // or it will fail (e.g., in CI without dbus) and drop the sender.
