@@ -120,8 +120,11 @@ pub enum DriverError {
     /// `TAG+="uaccess"` to receive a session-bound ACL on `/dev/hidrawX`
     /// (CLAUDE.md §6). This variant fires when the initial `open(2)` returns
     /// `EACCES`/`EPERM`, or when `read`/`write` returns the same after a
-    /// session change. The supervisor must drop the device handle and refuse
-    /// the device rather than retry.
+    /// session change. Because logind applies the `uaccess` ACL asynchronously
+    /// at session start, an attach-time `PermissionDenied` may be a race, not
+    /// a policy decision: the supervisor retries with bounded exponential
+    /// backoff (CLAUDE.md §1.4) and only then refuses the device — never
+    /// panics (CLAUDE.md §6).
     #[error("permission denied for hidraw node {path:?}")]
     PermissionDenied {
         /// Resolved path that the open syscall rejected.
@@ -150,6 +153,21 @@ pub enum DriverError {
     /// this variant propagate as a panic.
     #[error("device disconnected")]
     Disconnected,
+
+    /// The device's protocol has no equivalent for the requested operation.
+    ///
+    /// **Context:** Raised by legacy polyfill drivers for VIA-shaped
+    /// operations the vendor protocol cannot express — e.g. macro storage on
+    /// a GMK67, or a keymap layer beyond the ones the firmware exposes. The
+    /// D-Bus boundary maps this to
+    /// `org.freedesktop.DBus.Error.NotSupported` so clients can distinguish
+    /// "this device can't" from a transport failure. Never fatal to the
+    /// worker task.
+    #[error("operation not supported by this device: {op}")]
+    Unsupported {
+        /// Static description of the unsupported operation.
+        op: &'static str,
+    },
 
     /// A legacy vendor blob failed to compile from the shadow cache.
     ///
@@ -309,11 +327,12 @@ pub trait KeyboardDriver: Send + Sync {
     /// Writes a VIA "custom value" — a `(channel, value_id)` pair.
     ///
     /// **Context:** Maps to `id_custom_set_value` (VIA `0x07`). The write
-    /// applies live; persistence to EEPROM is a separate `id_custom_save`
-    /// (not issued here — `commit_to_nvram` does not currently persist
-    /// custom values), so a set survives until the next power cycle unless
-    /// explicitly saved. `data` carries the value bytes for the
-    /// `(channel, value_id)`.
+    /// applies live to firmware RAM; persistence is a separate
+    /// `id_custom_save` (VIA `0x09`) that [`Self::commit_to_nvram`] issues
+    /// once per touched channel. This split is deliberate wear-levelling:
+    /// live tweaks (a brightness slider drag) cost zero EEPROM cycles, and
+    /// a single save at commit persists the final value. `data` carries the
+    /// value bytes for the `(channel, value_id)`.
     async fn set_lighting(
         &mut self,
         channel: u8,
@@ -329,11 +348,14 @@ pub trait KeyboardDriver: Send + Sync {
     /// program.
     ///
     /// **Backend semantics (load-bearing — do not collapse the cases):**
-    /// - VIA, unbuffered (default): **no-op**. Returns `Ok(())` immediately.
-    ///   Writes were already persistent on issue.
+    /// - VIA, unbuffered (default): keycode writes were already persistent
+    ///   on issue, so the keymap part is a no-op. Lighting channels touched
+    ///   by [`Self::set_lighting`] since the last commit are persisted via
+    ///   one `id_custom_save` per channel.
     /// - VIA, coalescing on: flushes every buffered `(layer, row, col)`
     ///   entry to hardware via the same `set_keycode` round-trips that an
-    ///   unbuffered driver would have issued, then clears the buffer.
+    ///   unbuffered driver would have issued, clears the buffer, then
+    ///   issues the per-channel `id_custom_save`s as above.
     /// - Legacy: compiles the shadow struct into the vendor-specific binary
     ///   blob and pushes it monolithically to the device, bypassing the
     ///   500 ms debounce timer.

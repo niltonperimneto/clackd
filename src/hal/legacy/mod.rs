@@ -283,6 +283,22 @@ impl ShadowState {
         self.save();
     }
 
+    /// Replaces the entire keymap with hardware-confirmed entries and
+    /// persists the result.
+    ///
+    /// **Context:** Used by drivers that can read the keymap back from the
+    /// device (e.g. the GMK67 key-definition read commands) to adopt the
+    /// hardware as the new baseline. Any pending (dirty) host edits are
+    /// discarded — callers must only invoke this at attach time, before the
+    /// engine accepts `set_keycode` traffic for the device.
+    pub fn adopt_confirmed(&mut self, keymap: BTreeMap<(u8, u8, u8), u16>) {
+        self.keymap = keymap;
+        self.confirmed = self.keymap.clone();
+        self.dirty.clear();
+        self.status = CacheStatus::Confirmed;
+        self.save();
+    }
+
     // ── Commit lifecycle ─────────────────────────────────────────────────
 
     /// Phase 1 of commit: sets status to `Pending`.
@@ -354,15 +370,15 @@ impl ShadowState {
         };
 
         // Ensure the parent directory exists.
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                warn!(
-                    path = %parent.display(),
-                    error = %e,
-                    "failed to create shadow state directory",
-                );
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            warn!(
+                path = %parent.display(),
+                error = %e,
+                "failed to create shadow state directory",
+            );
+            return;
         }
 
         // Atomic write: write to .tmp, then rename.

@@ -471,11 +471,35 @@ async fn handle_command(
                         }
                         Err(e) => {
                             error!(device_id, error = %e, "device attach failed");
+                            if is_transient_attach_error(&e) {
+                                start_reconnect_backoff(registry, ReconnectCtx {
+                                    device_id,
+                                    vendor_id,
+                                    product_id,
+                                    hidraw_path,
+                                    driver_table: driver_table.clone(),
+                                    engine_tx: engine_tx.clone(),
+                                    lifecycle_tx: lifecycle_tx.clone(),
+                                    token: 0,
+                                });
+                            }
                         }
                     }
                 }
                 Err(e) => {
                     error!(device_id, error = %e, "driver initialization failed");
+                    if is_transient_attach_error(&e) {
+                        start_reconnect_backoff(registry, ReconnectCtx {
+                            device_id,
+                            vendor_id,
+                            product_id,
+                            hidraw_path,
+                            driver_table: driver_table.clone(),
+                            engine_tx: engine_tx.clone(),
+                            lifecycle_tx: lifecycle_tx.clone(),
+                            token: 0,
+                        });
+                    }
                 }
             }
         }
@@ -496,23 +520,16 @@ async fn handle_command(
                 let _ = lifecycle_tx.send(LifecycleEvent::DeviceRemoved(device_id.clone()));
                 if let DaemonError::Driver(DriverError::Disconnected) = *e {
                     info!(device_id, "device disconnected, starting reconnection backoff");
-                    let (cancel_tx, cancel_rx) = oneshot::channel();
-                    let token = registry.next_reconnect_token;
-                    registry.next_reconnect_token = registry.next_reconnect_token.wrapping_add(1);
-                    registry.reconnecting.insert(device_id.clone(), (cancel_tx, token));
-                    tokio::spawn(reconnect_task(
-                        ReconnectCtx {
-                            device_id,
-                            vendor_id: handle.vendor_id,
-                            product_id: handle.product_id,
-                            hidraw_path: handle.hidraw_path,
-                            driver_table: driver_table.clone(),
-                            engine_tx: engine_tx.clone(),
-                            lifecycle_tx: lifecycle_tx.clone(),
-                            token,
-                        },
-                        cancel_rx,
-                    ));
+                    start_reconnect_backoff(registry, ReconnectCtx {
+                        device_id,
+                        vendor_id: handle.vendor_id,
+                        product_id: handle.product_id,
+                        hidraw_path: handle.hidraw_path,
+                        driver_table: driver_table.clone(),
+                        engine_tx: engine_tx.clone(),
+                        lifecycle_tx: lifecycle_tx.clone(),
+                        token: 0,
+                    });
                 }
             }
         }
@@ -834,10 +851,10 @@ async fn run_device_worker(
                 let Some(op) = maybe_op else {
                     // All senders dropped: flush any pending debounced edit
                     // before exiting so a just-set keycode is not lost.
-                    if commit_deadline.take().is_some() {
-                        if let Err(e) = driver.commit_to_nvram().await {
-                            warn!(device_id, error = %e, "final flush on worker shutdown failed");
-                        }
+                    if commit_deadline.take().is_some()
+                        && let Err(e) = driver.commit_to_nvram().await
+                    {
+                        warn!(device_id, error = %e, "final flush on worker shutdown failed");
                     }
                     break;
                 };
@@ -930,7 +947,7 @@ async fn run_device_worker(
 
             // Debounced compile-and-push for buffered drivers. The precondition
             // gates the branch, so `unwrap` runs only when a deadline is set.
-            _ = tokio::time::sleep_until(commit_deadline.unwrap_or_else(|| tokio::time::Instant::now())), if commit_deadline.is_some() => {
+            _ = tokio::time::sleep_until(commit_deadline.unwrap_or_else(tokio::time::Instant::now)), if commit_deadline.is_some() => {
                 commit_deadline = None;
                 let result = driver.commit_to_nvram().await.map_err(DaemonError::from);
                 let is_fatal = is_fatal_driver_error(&result);
@@ -977,6 +994,38 @@ fn is_fatal_driver_error<T>(result: &Result<T, DaemonError>) -> bool {
             DriverError::Disconnected | DriverError::PermissionDenied { .. }
         ))
     )
+}
+
+/// Classifies an attach-time failure as transient and worth a backoff retry.
+///
+/// **Context:** Two conditions qualify. `PermissionDenied` covers the
+/// session-start race: a user-unit daemon's initial hidraw scan can run
+/// before systemd-logind has applied the `uaccess` ACLs for the new seat
+/// session, so the very first `open(2)` returns `EACCES` even though access
+/// arrives moments later. `Disconnected` covers an unplug racing the attach.
+/// Everything else (wrong interface, protocol violations, timeouts during
+/// probe) is deterministic for a given node and is not retried.
+#[inline]
+fn is_transient_attach_error(e: &DaemonError) -> bool {
+    matches!(
+        e,
+        DaemonError::Driver(DriverError::Disconnected | DriverError::PermissionDenied { .. })
+    )
+}
+
+/// Registers a cancellation handle in the registry and spawns the
+/// exponential-backoff [`reconnect_task`] for the device described by `ctx`.
+///
+/// **Context:** The token in `ctx` is overwritten with a fresh registry
+/// token; callers pass `token: 0` as a placeholder. A later
+/// `DeviceDisconnected` event cancels the task via the stored oneshot.
+fn start_reconnect_backoff(registry: &mut DeviceRegistry, mut ctx: ReconnectCtx) {
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let token = registry.next_reconnect_token;
+    registry.next_reconnect_token = registry.next_reconnect_token.wrapping_add(1);
+    ctx.token = token;
+    registry.reconnecting.insert(ctx.device_id.clone(), (cancel_tx, token));
+    tokio::spawn(reconnect_task(ctx, cancel_rx));
 }
 
 /// Bundles the shared context needed by the reconnection loop.
@@ -1052,7 +1101,7 @@ async fn reconnect_task(
                         return;
                     }
                     Err(e) => {
-                        if !matches!(e, DaemonError::Driver(DriverError::Disconnected)) {
+                        if !is_transient_attach_error(&e) {
                             info!(ctx.device_id, error = %e, "non-retriable error during attach — aborting reconnection");
                             break;
                         }
@@ -1060,7 +1109,7 @@ async fn reconnect_task(
                 }
             }
             Err(e) => {
-                if !matches!(e, DaemonError::Driver(DriverError::Disconnected)) {
+                if !is_transient_attach_error(&e) {
                     info!(ctx.device_id, error = %e, "non-retriable error during driver init — aborting reconnection");
                     break;
                 }
@@ -1296,6 +1345,7 @@ mod tests {
         let (worker_tx, _) = mpsc::channel(1);
         let handle = DeviceHandle {
             topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            model: "test_model".to_string(),
             tx: worker_tx,
             vendor_id: 0,
             product_id: 0,
@@ -1333,6 +1383,64 @@ mod tests {
         assert!(!registry.reconnecting.contains_key("dev1"));
     }
 
+    fn permission_denied_factory(path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
+        Err(DaemonError::Driver(DriverError::PermissionDenied { path: path.to_path_buf() }))
+    }
+
+    fn protocol_violation_factory(_path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
+        Err(DaemonError::Driver(DriverError::ProtocolViolation {
+            reason: "no VIA Usage Page (0xFF60) in HID descriptor".into(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn test_attach_permission_denied_starts_backoff() {
+        // A PermissionDenied at attach is transient (uaccess ACL race at
+        // session start) — the engine must schedule a backoff retry instead
+        // of abandoning the device.
+        let mut registry = DeviceRegistry::new();
+        let (tx, _, lt) = harness();
+        let mut by_vid_pid = std::collections::HashMap::new();
+        by_vid_pid.insert((0x05AC, 0x024F), permission_denied_factory as DriverFactory);
+        let dt = std::sync::Arc::new(DriverTable { by_vid_pid, via_fallback: None });
+
+        handle_command(
+            EngineCommand::DeviceConnected {
+                device_id: "dev1".into(),
+                vendor_id: 0x05AC,
+                product_id: 0x024F,
+                hidraw_path: PathBuf::from("/dev/hidraw7"),
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        assert!(registry.devices.is_empty());
+        assert!(registry.reconnecting.contains_key("dev1"));
+    }
+
+    #[tokio::test]
+    async fn test_attach_protocol_violation_does_not_retry() {
+        // A probe rejection is deterministic for the node — no backoff.
+        let mut registry = DeviceRegistry::new();
+        let (tx, _, lt) = harness();
+        let mut by_vid_pid = std::collections::HashMap::new();
+        by_vid_pid.insert((0x05AC, 0x024F), protocol_violation_factory as DriverFactory);
+        let dt = std::sync::Arc::new(DriverTable { by_vid_pid, via_fallback: None });
+
+        handle_command(
+            EngineCommand::DeviceConnected {
+                device_id: "dev1".into(),
+                vendor_id: 0x05AC,
+                product_id: 0x024F,
+                hidraw_path: PathBuf::from("/dev/hidraw7"),
+            },
+            &mut registry, &tx, &dt, &lt,
+        ).await;
+
+        assert!(registry.devices.is_empty());
+        assert!(!registry.reconnecting.contains_key("dev1"));
+    }
+
     #[tokio::test]
     async fn test_reattach_without_reconnect_state() {
         let mut registry = DeviceRegistry::new();
@@ -1342,6 +1450,7 @@ mod tests {
         let (worker_tx, _) = mpsc::channel(1);
         let handle = DeviceHandle {
             topology: DeviceTopology { matrix: topology::KeyMatrix { rows: 2, cols: 2 }, layer_count: 1 },
+            model: "test_model".to_string(),
             tx: worker_tx,
             vendor_id: 0,
             product_id: 0,

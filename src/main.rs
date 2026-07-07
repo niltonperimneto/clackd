@@ -178,6 +178,13 @@ struct DeviceConfig {
     /// Selects the vendor HAL driver in [`build_driver_table`].
     #[serde(default)]
     driver: Option<String>,
+    /// GMK67 only: read the keymap back from the device at attach and adopt
+    /// it as the shadow baseline. Off by default — the read commands
+    /// (`0x10`/`0x26`) are decoded from the vendor source but not yet
+    /// verified against real hardware. A failed read keeps the persisted
+    /// shadow; it never blocks the attach.
+    #[serde(default)]
+    sync_on_attach: bool,
 }
 
 /// Top-level structure for `$XDG_CONFIG_HOME/clackd/devices.toml`.
@@ -220,7 +227,13 @@ fn build_driver_table() -> DriverTable {
                             // back to VIA with a warning rather than dropping
                             // the device entirely.
                             let factory: engine::DriverFactory = match backend {
-                                "gmk67" => gmk67_factory,
+                                "gmk67" => {
+                                    if dev.sync_on_attach {
+                                        info!("gmk67 attach-time keymap read-back enabled (hardware-unverified opt-in)");
+                                        GMK67_SYNC_ON_ATTACH.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    gmk67_factory
+                                }
                                 "epomaker" => {
                                     warn!("driver = \"epomaker\" is deprecated; rename it to \"gmk67\" in devices.toml");
                                     gmk67_factory
@@ -326,6 +339,16 @@ fn via_fallback_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, D
 const EK68_MATRIX: (u8, u8) = (5, 15);
 const EK68_LAYERS: u8 = 2;
 
+/// Process-wide opt-in for the GMK67 attach-time keymap read-back.
+///
+/// **Context:** Driver factories are plain `fn` pointers (see
+/// [`engine::DriverFactory`]), so per-device options travel through
+/// process-wide state, mirroring [`COALESCE_INTERVAL`]. Set from
+/// `devices.toml` (`sync_on_attach = true` on a `driver = "gmk67"` entry)
+/// in [`build_driver_table`]; applies to every GMK67 device in the session.
+static GMK67_SYNC_ON_ATTACH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Factory for the GMK67-family (non-VIA) vendor driver (Epomaker EK68 /
 /// Zuoya GMK67).
 ///
@@ -334,7 +357,8 @@ const EK68_LAYERS: u8 = 2;
 /// `Gmk67Driver::new` probe rejects the non-vendor hidraw node of the
 /// composite device).
 fn gmk67_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
-    Ok(Box::new(Gmk67Driver::new(hidraw_path, EK68_MATRIX, EK68_LAYERS)?))
+    let sync = GMK67_SYNC_ON_ATTACH.load(std::sync::atomic::Ordering::Relaxed);
+    Ok(Box::new(Gmk67Driver::new(hidraw_path, EK68_MATRIX, EK68_LAYERS, sync)?))
 }
 
 /// Emits `READY=1` to the systemd notification socket.

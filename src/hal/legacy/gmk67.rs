@@ -63,8 +63,10 @@
 //!
 //! ## Macros
 //!
-//! Not yet decoded (deferred). The macro methods operate on the shadow buffer
-//! only. The GMK67 source names the macro area (`0x14` read / `0x15` write).
+//! Not yet decoded (deferred). The macro methods return
+//! [`DriverError::Unsupported`] (D-Bus `NotSupported`) rather than
+//! pretending to store data. The GMK67 source names the macro area
+//! (`0x14` read / `0x15` write) as the lead for a future implementation.
 //!
 //! # IO Discipline
 //!
@@ -81,6 +83,7 @@
 //! snapshot/rollback on commit, and `CacheStatus` tracking. The shadow file
 //! is stored at `$XDG_DATA_HOME/clackd/<vid>_<pid>.json`.
 
+use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -151,6 +154,76 @@ const BRIGHTNESS_MIN: u8 = 0x00;
 const BRIGHTNESS_MAX: u8 = 0x0F;
 const SPEED_MAX: u8 = 0x0F;
 
+// --- VIA custom-value compatibility layer ------------------------------------
+//
+// The VIA driver exposes lighting as `(channel, value_id)` custom values
+// (QMK `via.h`: channel 3 = RGB matrix; value ids below). To let frontends
+// drive both backends through one code path, `set_lighting`/`get_lighting`
+// accept the same addressing here and patch the corresponding field of the
+// shadow [`Lighting`] before re-rendering the full transaction. Channel 0
+// keeps the driver-native packed `[mode, r, g, b, ...]` payload.
+const VIA_CHANNEL_PACKED: u8 = 0; // id_custom_channel — driver-native packed format
+const VIA_CHANNEL_RGB_MATRIX: u8 = 3; // id_qmk_rgb_matrix_channel
+const VIA_VALUE_BRIGHTNESS: u8 = 1; // id_qmk_rgb_matrix_brightness
+const VIA_VALUE_EFFECT: u8 = 2; // id_qmk_rgb_matrix_effect
+const VIA_VALUE_SPEED: u8 = 3; // id_qmk_rgb_matrix_effect_speed
+const VIA_VALUE_COLOR: u8 = 4; // id_qmk_rgb_matrix_color (hue, sat)
+
+/// Scales a VIA 0–255 value onto the GMK67 0x00–0x0F range, rounding to
+/// nearest so 255 maps to 0x0F and 128 to 0x08.
+fn scale_255_to_15(v: u8) -> u8 {
+    ((v as u16 * 15 + 127) / 255) as u8
+}
+
+/// Inverse of [`scale_255_to_15`]; 0x0F maps back to 255.
+fn scale_15_to_255(v: u8) -> u8 {
+    (v.min(0x0F) as u16 * 255 / 15) as u8
+}
+
+/// Integer HSV→RGB at full value, hue and saturation in VIA's 0–255 range.
+/// Mirrors QMK's `hsv_to_rgb` so a colour set through the VIA channel looks
+/// the same on this board as on native VIA hardware.
+fn hs_to_rgb(h: u8, s: u8) -> (u8, u8, u8) {
+    if s == 0 {
+        return (255, 255, 255);
+    }
+    let region = h / 43;
+    let remainder = (h as u16 - region as u16 * 43) * 6;
+    let s = s as u16;
+    let p = (255 * (255 - s) / 255) as u8;
+    let q = (255 * (255 - (s * remainder) / 255) / 255) as u8;
+    let t = (255 * (255 - (s * (255 - remainder)) / 255) / 255) as u8;
+    match region {
+        0 => (255, t, p),
+        1 => (q, 255, p),
+        2 => (p, 255, t),
+        3 => (p, q, 255),
+        4 => (t, p, 255),
+        _ => (255, p, q),
+    }
+}
+
+/// Integer RGB→(hue, sat) in VIA's 0–255 range; the inverse direction for
+/// `get_lighting` reads of a colour stored as RGB in the shadow.
+fn rgb_to_hs(r: u8, g: u8, b: u8) -> (u8, u8) {
+    let max = r.max(g).max(b) as i32;
+    let min = r.min(g).min(b) as i32;
+    let delta = max - min;
+    if max == 0 || delta == 0 {
+        return (0, 0);
+    }
+    let s = (delta * 255 / max) as u8;
+    let (r, g, b) = (r as i32, g as i32, b as i32);
+    let h = if r == max {
+        43 * (g - b) / delta
+    } else if g == max {
+        85 + 43 * (b - r) / delta
+    } else {
+        171 + 43 * (r - g) / delta
+    };
+    (h.rem_euclid(256) as u8, s)
+}
+
 /// Whether `mode` is a renderable whole-keyboard mode this driver accepts.
 fn is_renderable_mode(mode: u8) -> bool {
     (MODE_STATIC..=MODE_EFFECT_MAX).contains(&mode) || mode == MODE_LIGHTS_OFF
@@ -215,14 +288,14 @@ fn keydef_read_command(layer: u8) -> Option<u8> {
 }
 
 fn find_matrix_pos_for_key_index(ki: u8) -> Option<(u8, u8)> {
-    for r in 0..EK68_ROWS {
-        for c in 0..EK68_COLS {
-            if KEY_INDEX[r][c] == ki && ki != NA {
-                return Some((r as u8, c as u8));
-            }
-        }
+    if ki == NA {
+        return None;
     }
-    None
+    KEY_INDEX.iter().enumerate().find_map(|(r, row)| {
+        row.iter()
+            .position(|&cell| cell == ki)
+            .map(|c| (r as u8, c as u8))
+    })
 }
 
 // -- HIDIOCSFEATURE / HIDIOCGFEATURE ioctl wrappers --
@@ -420,7 +493,7 @@ impl Lighting {
     }
 
     /// Converts to the persistence-friendly [`LightingState`].
-    fn to_lighting_state(&self) -> LightingState {
+    fn to_lighting_state(self) -> LightingState {
         LightingState {
             mode: self.mode,
             r: self.r,
@@ -507,6 +580,14 @@ pub struct Gmk67Driver {
     shadow: ShadowState,
     /// Live lighting state (pushed immediately, not batched).
     lighting: Lighting,
+    /// Opt-in (`devices.toml` `sync_on_attach`): read the keymap back from
+    /// the device at attach and adopt it as the shadow baseline. Off by
+    /// default — the read path (commands `0x10`/`0x26`) is decoded from the
+    /// vendor source but not yet verified against real hardware.
+    sync_on_attach: bool,
+    /// Whether the attach-time sync already ran (one attempt per session,
+    /// even if it failed).
+    synced: bool,
 }
 
 impl Gmk67Driver {
@@ -514,13 +595,21 @@ impl Gmk67Driver {
     ///
     /// Loads any previously persisted shadow state from
     /// `$XDG_DATA_HOME/clackd/<vid>_<pid>.json`. If no file exists, the
-    /// shadow starts empty (all positions report `KC_NO`).
+    /// shadow starts empty (all positions report `KC_NO`). When
+    /// `sync_on_attach` is set, the first topology query additionally reads
+    /// the keymap back from the device and adopts it as the baseline
+    /// (best-effort — a failed read keeps the persisted shadow).
     ///
     /// # Errors
     /// - [`DriverError::PermissionDenied`] / [`DriverError::Disconnected`] from `open(2)`.
     /// - [`DriverError::ProtocolViolation`] if the node is not the vendor
     ///   (64-byte Feature report) interface.
-    pub fn new(hidraw_path: &Path, matrix: (u8, u8), layers: u8) -> Result<Self, DriverError> {
+    pub fn new(
+        hidraw_path: &Path,
+        matrix: (u8, u8),
+        layers: u8,
+        sync_on_attach: bool,
+    ) -> Result<Self, DriverError> {
         let flags = OFlag::O_RDWR | OFlag::O_CLOEXEC;
         let owned = open(hidraw_path, flags, Mode::empty())
             .map_err(|errno| classify_open_errno(errno, hidraw_path))?;
@@ -547,6 +636,8 @@ impl Gmk67Driver {
             layers,
             shadow,
             lighting,
+            sync_on_attach,
+            synced: false,
         })
     }
 
@@ -564,6 +655,8 @@ impl Gmk67Driver {
             layers,
             shadow: ShadowState::ephemeral(),
             lighting: Lighting::default(),
+            sync_on_attach: false,
+            synced: false,
         }
     }
 
@@ -577,9 +670,36 @@ impl Gmk67Driver {
         }
     }
 
+    /// Best-effort transaction abort: sends `CMD_COMMUNICATION_END` so the
+    /// board leaves customization mode instead of sitting mid-transaction
+    /// with a half-written area. Its own failure is logged, not propagated —
+    /// the caller is already unwinding the original error.
+    async fn abort_transaction(&self) {
+        if let Err(e) = self
+            .io
+            .set_feature(encode_cmd(CMD_COMMUNICATION_END))
+            .await
+        {
+            warn!(
+                device_id = %self.device_id,
+                error = %e,
+                "transaction abort frame failed — board may stay in customization mode until replugged",
+            );
+        }
+    }
+
     /// Runs the full effect/static render transaction (doc section 4.3). Without
     /// the surrounding `0x04`-header framing the mode frame renders nothing.
+    /// A mid-transaction failure is followed by a best-effort abort frame.
     async fn render_effect(&mut self, lighting: Lighting) -> Result<(), DriverError> {
+        let result = self.render_effect_frames(lighting).await;
+        if result.is_err() {
+            self.abort_transaction().await;
+        }
+        result
+    }
+
+    async fn render_effect_frames(&mut self, lighting: Lighting) -> Result<(), DriverError> {
         self.io
             .set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION))
             .await?;
@@ -602,8 +722,21 @@ impl Gmk67Driver {
     /// customization-on → start-keydef-page(`command`) → 9 pages → end →
     /// effect-start, each `Send` paced by a `Read` (doc section 5). `command`
     /// selects the layer's area (`0x11` base / `0x27` Fn); `entries` is
-    /// `key_index -> keycode` for that layer.
+    /// `key_index -> keycode` for that layer. A mid-transaction failure is
+    /// followed by a best-effort abort frame.
     async fn commit_keymap(&self, command: u8, entries: &[(u8, u16)]) -> Result<(), DriverError> {
+        let result = self.commit_keymap_frames(command, entries).await;
+        if result.is_err() {
+            self.abort_transaction().await;
+        }
+        result
+    }
+
+    async fn commit_keymap_frames(
+        &self,
+        command: u8,
+        entries: &[(u8, u16)],
+    ) -> Result<(), DriverError> {
         let buf = encode_keydef_buffer(entries);
         self.io
             .set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION))
@@ -633,6 +766,10 @@ impl Gmk67Driver {
 #[async_trait]
 impl KeyboardDriver for Gmk67Driver {
     async fn get_matrix_dimensions(&mut self) -> Result<(u8, u8), DriverError> {
+        // Attach-time seam (the engine queries topology once per session):
+        // run the opt-in keymap read-back here, where an async transaction
+        // is possible — `new()` is synchronous by the factory contract.
+        self.maybe_sync_on_attach().await;
         Ok(self.matrix)
     }
 
@@ -641,8 +778,9 @@ impl KeyboardDriver for Gmk67Driver {
     }
 
     async fn get_keycode(&mut self, layer: u8, row: u8, col: u8) -> Result<u16, DriverError> {
-        // Shadow read — the device exposes no keymap read-back. Unwritten
-        // positions report KC_NO (0x0000); a frontend overlays factory defaults.
+        // Shadow read — the device exposes no on-demand keymap read-back.
+        // Unwritten positions report KC_NO (0x0000); a frontend overlays
+        // factory defaults.
         Ok(self.shadow.get_keycode(layer, row, col))
     }
 
@@ -653,25 +791,57 @@ impl KeyboardDriver for Gmk67Driver {
         col: u8,
         keycode: u16,
     ) -> Result<(), DriverError> {
+        // Validate up front instead of shadowing a value that the commit
+        // would silently drop: the board has exactly two key-definition
+        // areas (base + Fn), and the matrix rectangle contains cells with
+        // no physical key.
+        if keydef_command(layer).is_none() {
+            return Err(DriverError::Unsupported {
+                op: "keymap layer beyond base/Fn on GMK67",
+            });
+        }
+        if key_index_for(row, col).is_none() {
+            return Err(DriverError::Unsupported {
+                op: "no physical key at this matrix position on GMK67",
+            });
+        }
         self.shadow.set_keycode(layer, row, col, keycode);
         Ok(())
     }
 
-    async fn get_macro_buffer(&mut self, _offset: u16, length: u8) -> Result<Vec<u8>, DriverError> {
-        // Macro format not yet decoded — shadow only.
-        Ok(vec![0u8; length as usize])
+    async fn get_macro_buffer(&mut self, _offset: u16, _length: u8) -> Result<Vec<u8>, DriverError> {
+        // The macro wire format (`0x14` read / `0x15` write) is not yet
+        // decoded; reporting NotSupported beats returning fabricated zeros.
+        Err(DriverError::Unsupported {
+            op: "macro storage on GMK67 (wire format not yet decoded)",
+        })
     }
 
     async fn set_macro_buffer(&mut self, _offset: u16, _data: &[u8]) -> Result<(), DriverError> {
-        warn!(device_id = %self.device_id, "EK68 macro write ignored — wire format not yet decoded");
-        Ok(())
+        Err(DriverError::Unsupported {
+            op: "macro storage on GMK67 (wire format not yet decoded)",
+        })
     }
 
-    /// `channel` and `value_id` are unused for the EK68; `data` is
-    /// `[mode, r, g, b, brightness?, random?, speed?, direction?]`. The frame
-    /// is rendered via the full transaction (not a single write).
-    async fn set_lighting(&mut self, _channel: u8, _value_id: u8, data: &[u8]) -> Result<(), DriverError> {
-        let lighting = Lighting::from_bytes(data);
+    /// Two addressing modes (see the VIA-compatibility constants above):
+    ///
+    /// - `channel` 0: `data` is the driver-native packed payload
+    ///   `[mode, r, g, b, brightness?, random?, speed?, direction?]`.
+    /// - `channel` 3 (VIA RGB-matrix): `value_id` selects brightness /
+    ///   effect / speed / colour with VIA value encodings, patching only
+    ///   that field of the current lighting.
+    ///
+    /// Either way the frame is rendered via the full transaction.
+    async fn set_lighting(&mut self, channel: u8, value_id: u8, data: &[u8]) -> Result<(), DriverError> {
+        let lighting = match channel {
+            VIA_CHANNEL_PACKED => Lighting::from_bytes(data),
+            VIA_CHANNEL_RGB_MATRIX => self.lighting_with_via_value(value_id, data)?,
+            _ => {
+                return Err(DriverError::Unsupported {
+                    op: "lighting channel (GMK67 supports packed channel 0 and RGB-matrix channel 3)",
+                });
+            }
+        };
         if !is_renderable_mode(lighting.mode) {
             return Err(DriverError::ProtocolViolation {
                 reason: "EK68 lighting mode out of range (effects 0x01..=0x13, or 0x80 off)",
@@ -687,8 +857,31 @@ impl KeyboardDriver for Gmk67Driver {
         Ok(())
     }
 
-    async fn get_lighting(&mut self, _channel: u8, _value_id: u8) -> Result<Vec<u8>, DriverError> {
-        Ok(self.lighting.to_bytes())
+    async fn get_lighting(&mut self, channel: u8, value_id: u8) -> Result<Vec<u8>, DriverError> {
+        match channel {
+            VIA_CHANNEL_PACKED => Ok(self.lighting.to_bytes()),
+            VIA_CHANNEL_RGB_MATRIX => match value_id {
+                VIA_VALUE_BRIGHTNESS => Ok(vec![scale_15_to_255(self.lighting.brightness)]),
+                // VIA effect 0 means "off"; the board expresses off as the
+                // dedicated 0x80 mode.
+                VIA_VALUE_EFFECT => Ok(vec![if self.lighting.mode == MODE_LIGHTS_OFF {
+                    0
+                } else {
+                    self.lighting.mode
+                }]),
+                VIA_VALUE_SPEED => Ok(vec![scale_15_to_255(self.lighting.speed)]),
+                VIA_VALUE_COLOR => {
+                    let (h, s) = rgb_to_hs(self.lighting.r, self.lighting.g, self.lighting.b);
+                    Ok(vec![h, s])
+                }
+                _ => Err(DriverError::Unsupported {
+                    op: "RGB-matrix value id (GMK67 supports brightness/effect/speed/color)",
+                }),
+            },
+            _ => Err(DriverError::Unsupported {
+                op: "lighting channel (GMK67 supports packed channel 0 and RGB-matrix channel 3)",
+            }),
+        }
     }
 
     /// Flushes the keymap to the device's key-definition areas (doc section 5).
@@ -763,64 +956,117 @@ impl Gmk67Driver {
         Ok(())
     }
 
-    /// Attempts to read the actual EEPROM keymap from the device.
-    /// This queries the key-definition area using the `0x10` (base) and `0x26` (Fn) read commands.
-    /// Upon success, populates the shadow state with the real hardware layout.
+    /// Builds a [`Lighting`] by patching one VIA RGB-matrix value onto the
+    /// current state. VIA encodings: brightness/speed are 0–255 (scaled onto
+    /// the board's 0x00–0x0F range), effect 0 means "off", colour is
+    /// `[hue, sat]` at full value.
+    fn lighting_with_via_value(&self, value_id: u8, data: &[u8]) -> Result<Lighting, DriverError> {
+        let missing = DriverError::ProtocolViolation {
+            reason: "short data for VIA RGB-matrix lighting value",
+        };
+        let mut lighting = self.lighting;
+        match value_id {
+            VIA_VALUE_BRIGHTNESS => {
+                lighting.brightness = scale_255_to_15(*data.first().ok_or(missing)?);
+            }
+            VIA_VALUE_EFFECT => {
+                let effect = *data.first().ok_or(missing)?;
+                lighting.mode = if effect == 0 { MODE_LIGHTS_OFF } else { effect };
+            }
+            VIA_VALUE_SPEED => {
+                lighting.speed = scale_255_to_15(*data.first().ok_or(missing)?);
+            }
+            VIA_VALUE_COLOR => {
+                let [h, s] = *data.first_chunk::<2>().ok_or(missing)?;
+                (lighting.r, lighting.g, lighting.b) = hs_to_rgb(h, s);
+                lighting.random = false;
+            }
+            _ => {
+                return Err(DriverError::Unsupported {
+                    op: "RGB-matrix value id (GMK67 supports brightness/effect/speed/color)",
+                });
+            }
+        }
+        Ok(lighting)
+    }
+
+    /// Runs the opt-in attach-time keymap read-back exactly once per session.
+    /// Best-effort: a failed read keeps the persisted shadow — the device
+    /// must stay usable even when the (hardware-unverified) read path fails.
+    async fn maybe_sync_on_attach(&mut self) {
+        if !self.sync_on_attach || self.synced {
+            return;
+        }
+        self.synced = true;
+        match self.sync_eeprom().await {
+            Ok(()) => info!(device_id = %self.device_id, "adopted device keymap as shadow baseline"),
+            Err(e) => warn!(
+                device_id = %self.device_id,
+                error = %e,
+                "keymap read-back failed — keeping persisted shadow",
+            ),
+        }
+    }
+
+    /// Reads the keymap back from the device's key-definition areas (`0x10`
+    /// base / `0x26` Fn) and, only if **every** layer reads cleanly, adopts
+    /// the result as the confirmed shadow baseline. A mid-read failure
+    /// leaves the shadow untouched (and sends the best-effort abort frame),
+    /// so a later commit can never push a half-read keymap to the board.
     async fn sync_eeprom(&mut self) -> Result<(), DriverError> {
-        let mut any_success = false;
+        let mut entries: BTreeMap<(u8, u8, u8), u16> = BTreeMap::new();
 
         for layer in 0..self.layers {
             let Some(command) = keydef_read_command(layer) else {
                 continue;
             };
+            if let Err(e) = self.read_keydef_layer(command, layer, &mut entries).await {
+                self.abort_transaction().await;
+                return Err(e);
+            }
+        }
 
-            // Initiate read transaction for the layer
-            self.io
-                .set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION))
-                .await?;
-            self.read_ack().await;
-            self.io
-                .set_feature(encode_start_keydef_page(command))
-                .await?;
-            self.read_ack().await;
+        self.shadow.adopt_confirmed(entries);
+        Ok(())
+    }
 
-            for p in 0..KEY_DEF_PAGES {
-                // Read a page from the device
-                let page = self.io.get_feature(REPORT_ID).await?;
-                
-                // Parse the 64-byte page into 16 entries (4 bytes each)
-                for entry in 0..16 {
-                    let offset = entry * 4;
-                    if offset + 3 < FRAME_LEN {
-                        if page[offset] == KEY_DEF_ENTRY_MARKER {
-                            let kc_lo = page[offset + 2];
-                            let kc_hi = page[offset + 3];
-                            let keycode = u16::from_le_bytes([kc_lo, kc_hi]);
+    /// Reads one layer's 9-page key-definition area into `entries`.
+    async fn read_keydef_layer(
+        &self,
+        command: u8,
+        layer: u8,
+        entries: &mut BTreeMap<(u8, u8, u8), u16>,
+    ) -> Result<(), DriverError> {
+        self.io
+            .set_feature(encode_cmd(CMD_TURN_ON_CUSTOMIZATION))
+            .await?;
+        self.read_ack().await;
+        self.io
+            .set_feature(encode_start_keydef_page(command))
+            .await?;
+        self.read_ack().await;
 
-                            let ki = (p * 16 + entry) as u8;
-                            if let Some((row, col)) = find_matrix_pos_for_key_index(ki) {
-                                // Populate the shadow state directly from hardware
-                                self.shadow.set_keycode(layer, row, col, keycode);
-                            }
-                        }
-                    }
+        for p in 0..KEY_DEF_PAGES {
+            let page = self.io.get_feature(REPORT_ID).await?;
+            // Each 64-byte page carries 16 four-byte entries; a leading
+            // 0x02 marker means the slot holds an explicit remap.
+            for entry in 0..FRAME_LEN / 4 {
+                let offset = entry * 4;
+                if page[offset] != KEY_DEF_ENTRY_MARKER {
+                    continue;
+                }
+                let keycode = u16::from_le_bytes([page[offset + 2], page[offset + 3]]);
+                let ki = (p * (FRAME_LEN / 4) + entry) as u8;
+                if let Some((row, col)) = find_matrix_pos_for_key_index(ki) {
+                    entries.insert((layer, row, col), keycode);
                 }
             }
-
-            self.io
-                .set_feature(encode_cmd(CMD_COMMUNICATION_END))
-                .await?;
-            self.read_ack().await;
-            
-            any_success = true;
         }
 
-        if any_success {
-            // Confirm the new baseline shadow state to clear any dirty flags from setup
-            self.shadow.prepare_commit();
-            self.shadow.confirm_commit();
-        }
-
+        self.io
+            .set_feature(encode_cmd(CMD_COMMUNICATION_END))
+            .await?;
+        self.read_ack().await;
         Ok(())
     }
 }
@@ -929,12 +1175,8 @@ pub(crate) fn descriptor_has_feature_report(descriptor: &[u8], min_count: u32) -
                     _ => 0,
                 };
             }
-            0xB0 => {
-                // Feature (main)
-                if report_count >= min_count {
-                    return true;
-                }
-            }
+            // Feature (main) with a large-enough Report Count.
+            0xB0 if report_count >= min_count => return true,
             _ => {}
         }
         i += 1 + data_len;
@@ -951,18 +1193,29 @@ mod tests {
     struct MockIo {
         sent: Mutex<Vec<[u8; FRAME_LEN]>>,
         fail: bool,
+        /// Fail the set_feature attempt whose (successful-send) index equals
+        /// this value, then clear — so the recovery/abort frame that follows
+        /// succeeds and gets recorded.
+        fail_nth_set: Mutex<Option<usize>>,
+        /// When set, every get_feature fails with Disconnected.
+        fail_get: std::sync::atomic::AtomicBool,
+        /// Canned frame served by get_feature.
+        get_response: Mutex<[u8; FRAME_LEN]>,
     }
     impl MockIo {
         fn new() -> Self {
             Self {
                 sent: Mutex::new(Vec::new()),
                 fail: false,
+                fail_nth_set: Mutex::new(None),
+                fail_get: std::sync::atomic::AtomicBool::new(false),
+                get_response: Mutex::new([0u8; FRAME_LEN]),
             }
         }
         fn failing() -> Self {
             Self {
-                sent: Mutex::new(Vec::new()),
                 fail: true,
+                ..Self::new()
             }
         }
         fn sent(&self) -> Vec<[u8; FRAME_LEN]> {
@@ -975,11 +1228,20 @@ mod tests {
             if self.fail {
                 return Err(DriverError::Disconnected);
             }
-            self.sent.lock().unwrap().push(payload);
+            let mut sent = self.sent.lock().unwrap();
+            let mut nth = self.fail_nth_set.lock().unwrap();
+            if *nth == Some(sent.len()) {
+                *nth = None;
+                return Err(DriverError::Disconnected);
+            }
+            sent.push(payload);
             Ok(())
         }
         async fn get_feature(&self, _report_id: u8) -> Result<[u8; FRAME_LEN], DriverError> {
-            Ok([0u8; FRAME_LEN])
+            if self.fail_get.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(DriverError::Disconnected);
+            }
+            Ok(*self.get_response.lock().unwrap())
         }
     }
 
@@ -1071,9 +1333,10 @@ mod tests {
     fn keydef_buffer_places_entry_at_index_times_4() {
         // Esc (key_index 1) and Space (key_index 94) -> KC_A (little-endian).
         let buf = encode_keydef_buffer(&[(1, 0x0004), (94, 0x0004)]);
-        assert_eq!(buf[1 * 4], KEY_DEF_ENTRY_MARKER);
-        assert_eq!(buf[1 * 4 + 2], 0x04);
-        assert_eq!(buf[1 * 4 + 3], 0x00);
+        // Esc is key_index 1 → absolute offset 1 * 4 = 4.
+        assert_eq!(buf[4], KEY_DEF_ENTRY_MARKER);
+        assert_eq!(buf[6], 0x04);
+        assert_eq!(buf[7], 0x00);
         assert_eq!(buf[94 * 4], KEY_DEF_ENTRY_MARKER);
         assert_eq!(buf[94 * 4 + 2], 0x04);
         // Check code lives on the last page (bytes 62/63 of page 8).
@@ -1086,7 +1349,7 @@ mod tests {
     async fn set_lighting_runs_full_transaction() {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
-        d.set_lighting(0, &[MODE_STATIC, 0x00, 0xFF, 0x00, 0x08, 0])
+        d.set_lighting(0, 0, &[MODE_STATIC, 0x00, 0xFF, 0x00, 0x08, 0])
             .await
             .unwrap();
 
@@ -1116,7 +1379,7 @@ mod tests {
         assert_eq!(sent[4][1], CMD_LED_EFFECT_START);
 
         // get_lighting reflects the last set.
-        assert_eq!(d.get_lighting(0).await.unwrap()[2], 0xFF);
+        assert_eq!(d.get_lighting(0, 0).await.unwrap()[2], 0xFF);
     }
 
     #[tokio::test]
@@ -1124,7 +1387,7 @@ mod tests {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
         // 0x14 is just past the effect range and is not the 0x80 off mode.
-        let err = d.set_lighting(0, &[0x14, 0, 0, 0]).await.unwrap_err();
+        let err = d.set_lighting(0, 0, &[0x14, 0, 0, 0]).await.unwrap_err();
         assert!(matches!(err, DriverError::ProtocolViolation { .. }));
         assert!(io.sent().is_empty());
     }
@@ -1134,7 +1397,7 @@ mod tests {
         let io = Arc::new(MockIo::failing());
         let mut d = driver_with(io.clone());
         assert!(matches!(
-            d.set_lighting(0, &[MODE_STATIC, 0xFF, 0, 0]).await,
+            d.set_lighting(0, 0, &[MODE_STATIC, 0xFF, 0, 0]).await,
             Err(DriverError::Disconnected)
         ));
     }
@@ -1229,11 +1492,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_skips_when_only_unknown_positions() {
+    async fn set_keycode_rejects_invalid_positions_early() {
         let io = Arc::new(MockIo::new());
         let mut d = driver_with(io.clone());
-        d.set_keycode(0, 4, 9, 0x0004).await.unwrap(); // empty matrix cell
+        // Empty matrix cell: inside the (5,15) rectangle but no physical key.
+        assert!(matches!(
+            d.set_keycode(0, 4, 9, 0x0004).await,
+            Err(DriverError::Unsupported { .. })
+        ));
+        // Layer without a key-definition area.
+        assert!(matches!(
+            d.set_keycode(2, 0, 0, 0x0004).await,
+            Err(DriverError::Unsupported { .. })
+        ));
+        // Nothing was shadowed, so a commit stays a clean no-op.
         d.commit_to_nvram().await.unwrap();
+        assert!(io.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn macros_report_unsupported() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        assert!(matches!(
+            d.get_macro_buffer(0, 8).await,
+            Err(DriverError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            d.set_macro_buffer(0, &[1, 2, 3]).await,
+            Err(DriverError::Unsupported { .. })
+        ));
         assert!(io.sent().is_empty());
     }
 
@@ -1269,6 +1557,185 @@ mod tests {
         assert!(d.commit_to_nvram().await.is_err());
         // Keymap reverts to the last successfully committed value.
         assert_eq!(d.get_keycode(0, 0, 0).await.unwrap(), 0x0004);
+    }
+
+    #[tokio::test]
+    async fn failed_transaction_sends_abort_frame() {
+        let io = Arc::new(MockIo::new());
+        // The lighting transaction is: cust-on(0), page(1), mode(2), end(3),
+        // start(4). Fail the mode frame; the abort must follow.
+        *io.fail_nth_set.lock().unwrap() = Some(2);
+        let mut d = driver_with(io.clone());
+        assert!(
+            d.set_lighting(0, 0, &[MODE_STATIC, 0xFF, 0, 0]).await.is_err()
+        );
+        let sent = io.sent();
+        assert_eq!(sent.len(), 3, "cust-on, page, then the abort frame");
+        let last = sent.last().unwrap();
+        assert_eq!(
+            (last[0], last[1]),
+            (PACKET_HEADER, CMD_COMMUNICATION_END),
+            "board must be released from customization mode on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_keymap_commit_sends_abort_frame() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        d.set_keycode(0, 0, 0, 0x0004).await.unwrap();
+        // Fail the third key-definition page (frames: cust-on 0, start 1,
+        // pages 2..11): index 4 is page 2.
+        *io.fail_nth_set.lock().unwrap() = Some(4);
+        assert!(d.commit_to_nvram().await.is_err());
+        let sent = io.sent();
+        let last = sent.last().unwrap();
+        assert_eq!(
+            (last[0], last[1]),
+            (PACKET_HEADER, CMD_COMMUNICATION_END),
+            "abort frame must terminate the half-written key-def transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn via_channel_brightness_patches_single_field() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        // Establish a red static base through the packed channel.
+        d.set_lighting(0, 0, &[MODE_STATIC, 0xFF, 0x00, 0x00, 0x0F, 0])
+            .await
+            .unwrap();
+        // VIA RGB-matrix brightness 128/255 → board 0x08.
+        d.set_lighting(VIA_CHANNEL_RGB_MATRIX, VIA_VALUE_BRIGHTNESS, &[128])
+            .await
+            .unwrap();
+
+        let sent = io.sent();
+        // Second transaction's mode frame is at index 5 + 2.
+        let mode_frame = &sent[7];
+        assert_eq!(mode_frame[MF_BRIGHTNESS], 0x08);
+        assert_eq!(mode_frame[MF_MODE], MODE_STATIC, "mode untouched");
+        assert_eq!(mode_frame[MF_R], 0xFF, "colour untouched");
+
+        // The VIA-shaped read reflects the board-resolution value.
+        let got = d
+            .get_lighting(VIA_CHANNEL_RGB_MATRIX, VIA_VALUE_BRIGHTNESS)
+            .await
+            .unwrap();
+        assert_eq!(got, vec![scale_15_to_255(0x08)]);
+    }
+
+    #[tokio::test]
+    async fn via_channel_color_sets_rgb_from_hue_sat() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        // Hue 0, full saturation = pure red in VIA's HSV space.
+        d.set_lighting(VIA_CHANNEL_RGB_MATRIX, VIA_VALUE_COLOR, &[0, 255])
+            .await
+            .unwrap();
+        let sent = io.sent();
+        let mode_frame = &sent[2];
+        assert_eq!((mode_frame[MF_R], mode_frame[MF_G], mode_frame[MF_B]), (255, 0, 0));
+
+        // Round-trip through the VIA-shaped read.
+        let hs = d
+            .get_lighting(VIA_CHANNEL_RGB_MATRIX, VIA_VALUE_COLOR)
+            .await
+            .unwrap();
+        assert_eq!(hs, vec![0, 255]);
+    }
+
+    #[tokio::test]
+    async fn via_effect_zero_maps_to_lights_off() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        d.set_lighting(VIA_CHANNEL_RGB_MATRIX, VIA_VALUE_EFFECT, &[0])
+            .await
+            .unwrap();
+        assert_eq!(io.sent()[2][MF_MODE], MODE_LIGHTS_OFF);
+        let got = d
+            .get_lighting(VIA_CHANNEL_RGB_MATRIX, VIA_VALUE_EFFECT)
+            .await
+            .unwrap();
+        assert_eq!(got, vec![0], "off reads back as VIA effect 0");
+    }
+
+    #[tokio::test]
+    async fn unsupported_lighting_channels_and_values_rejected() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        assert!(matches!(
+            d.set_lighting(2, 1, &[10]).await, // rgblight channel: not on this board
+            Err(DriverError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            d.get_lighting(VIA_CHANNEL_RGB_MATRIX, 9).await,
+            Err(DriverError::Unsupported { .. })
+        ));
+        assert!(io.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_eeprom_failure_leaves_shadow_untouched() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        // Establish a committed baseline.
+        d.set_keycode(0, 0, 0, 0x0004).await.unwrap();
+        d.commit_to_nvram().await.unwrap();
+
+        // The read path fails mid-transaction.
+        io.fail_get.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(d.sync_eeprom().await.is_err());
+
+        // Shadow unchanged: no half-read keymap can reach a later commit.
+        assert_eq!(d.get_keycode(0, 0, 0).await.unwrap(), 0x0004);
+        // The abort frame terminated the read transaction.
+        let sent = io.sent();
+        let last = sent.last().unwrap();
+        assert_eq!((last[0], last[1]), (PACKET_HEADER, CMD_COMMUNICATION_END));
+    }
+
+    #[tokio::test]
+    async fn sync_eeprom_adopts_device_keymap() {
+        let io = Arc::new(MockIo::new());
+        let mut d = driver_with(io.clone());
+        // Stale host-side entry that the device does not have.
+        d.set_keycode(0, 2, 7, 0x0099).await.unwrap();
+        d.commit_to_nvram().await.unwrap();
+
+        // Device pages report a remap in slot 1 (Esc): [0x02, _, kc_lo, kc_hi]
+        // at offset 4 of page 0. (The same frame is served for every page,
+        // planting entries at other valid key indexes too — irrelevant here.)
+        {
+            let mut resp = io.get_response.lock().unwrap();
+            resp[4] = KEY_DEF_ENTRY_MARKER;
+            resp[6] = 0x04; // KC_A little-endian
+            resp[7] = 0x00;
+        }
+        d.sync_eeprom().await.unwrap();
+
+        // Adopted: the device's Esc remap is present…
+        assert_eq!(d.get_keycode(0, 0, 0).await.unwrap(), 0x0004);
+        // …and the stale host entry was replaced by the device baseline.
+        assert_eq!(d.get_keycode(0, 2, 7).await.unwrap(), 0x0000);
+    }
+
+    #[test]
+    fn via_scale_helpers_round_trip_extremes() {
+        assert_eq!(scale_255_to_15(0), 0x00);
+        assert_eq!(scale_255_to_15(255), 0x0F);
+        assert_eq!(scale_255_to_15(128), 0x08);
+        assert_eq!(scale_15_to_255(0x0F), 255);
+        assert_eq!(scale_15_to_255(0x00), 0);
+    }
+
+    #[test]
+    fn hs_rgb_conversion_primaries() {
+        assert_eq!(hs_to_rgb(0, 255), (255, 0, 0)); // red
+        assert_eq!(hs_to_rgb(85, 255).1, 255); // green-dominant at hue 85
+        assert_eq!(hs_to_rgb(0, 0), (255, 255, 255)); // desaturated = white
+        assert_eq!(rgb_to_hs(255, 0, 0), (0, 255));
+        assert_eq!(rgb_to_hs(128, 128, 128), (0, 0), "grey has no hue/sat");
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //! | `DeviceNotFound`                             | `UnknownObject`     |
 //! | `DeviceUnauthorized`                         | `AccessDenied`      |
 //! | `Driver(DriverError::PermissionDenied { })`  | `AccessDenied`      |
+//! | `Driver(DriverError::Unsupported { })`       | `NotSupported`      |
 //! | everything else                              | `Failed`            |
 
 use tokio::sync::{mpsc, oneshot};
@@ -264,9 +265,10 @@ impl ClackdInterface {
 
     /// Writes a VIA custom value `(channel, value_id)` — RGB/backlight config.
     ///
-    /// **Context:** Applies live; not persisted to EEPROM unless a separate
-    /// save is issued (not currently exposed). See [`Self::get_lighting`]
-    /// for the channel/value_id meanings.
+    /// **Context:** Applies live to firmware RAM; persistence happens on the
+    /// next `Commit` call, which issues one `id_custom_save` per channel
+    /// touched since the last commit. See [`Self::get_lighting`] for the
+    /// channel/value_id meanings.
     async fn set_lighting(
         &self,
         device_id: &str,
@@ -320,6 +322,9 @@ impl From<DaemonError> for zbus::fdo::Error {
             | DaemonError::Driver(DriverError::PermissionDenied { .. }) => {
                 zbus::fdo::Error::AccessDenied(e.to_string())
             }
+            DaemonError::Driver(DriverError::Unsupported { .. }) => {
+                zbus::fdo::Error::NotSupported(e.to_string())
+            }
             _ => zbus::fdo::Error::Failed(e.to_string()),
         }
     }
@@ -353,6 +358,16 @@ mod tests {
         assert!(
             matches!(zbus_err, zbus::fdo::Error::AccessDenied(_)),
             "expected AccessDenied, got {zbus_err:?}"
+        );
+    }
+
+    #[test]
+    fn driver_unsupported_maps_to_not_supported() {
+        let err = DaemonError::Driver(DriverError::Unsupported { op: "macro storage" });
+        let zbus_err: zbus::fdo::Error = err.into();
+        assert!(
+            matches!(zbus_err, zbus::fdo::Error::NotSupported(_)),
+            "expected NotSupported, got {zbus_err:?}"
         );
     }
 

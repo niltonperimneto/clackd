@@ -14,11 +14,19 @@
 //!
 //! All command IDs implemented here are from QMK's `quantum/via.h`:
 //!
-//! | ID    | Constant                              | Purpose                           |
-//! |-------|---------------------------------------|-----------------------------------|
-//! | 0x04  | `id_dynamic_keymap_get_keycode`       | Read a keycode at `(L, R, C)`     |
-//! | 0x05  | `id_dynamic_keymap_set_keycode`       | Write a keycode at `(L, R, C)`    |
-//! | 0x11  | `id_dynamic_keymap_get_layer_count`   | Query layer-count                 |
+//! | ID    | Constant                                  | Purpose                            |
+//! |-------|-------------------------------------------|------------------------------------|
+//! | 0x01  | `id_get_protocol_version`                 | Probe protocol version at attach   |
+//! | 0x04  | `id_dynamic_keymap_get_keycode`           | Read a keycode at `(L, R, C)`      |
+//! | 0x05  | `id_dynamic_keymap_set_keycode`           | Write a keycode at `(L, R, C)`     |
+//! | 0x07  | `id_custom_set_value`                     | Write a lighting/custom value      |
+//! | 0x08  | `id_custom_get_value`                     | Read a lighting/custom value       |
+//! | 0x09  | `id_custom_save`                          | Persist a channel's values to NVRAM|
+//! | 0x0C  | `id_dynamic_keymap_macro_get_count`       | Number of macro slots              |
+//! | 0x0D  | `id_dynamic_keymap_macro_get_buffer_size` | Total macro buffer bytes           |
+//! | 0x0E  | `id_dynamic_keymap_macro_get_buffer`      | Read a macro-buffer chunk          |
+//! | 0x0F  | `id_dynamic_keymap_macro_set_buffer`      | Write a macro-buffer chunk         |
+//! | 0x11  | `id_dynamic_keymap_get_layer_count`       | Query layer-count                  |
 //!
 //! # Why Matrix Dimensions Are Not Probed
 //!
@@ -66,7 +74,7 @@
 //! `mpsc::Sender<CoalescerOp>` facade. Per SKILLS.md §1.1 this avoids
 //! `Arc<Mutex>` over device state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,13 +106,20 @@ const VIA_HIDRAW_REPORT_ID: u8 = 0x00;
 // VIA command IDs — values are fixed by QMK's `quantum/via.h` enum
 // `via_command_id`. Do NOT guess these: 0x0B is `id_bootloader_jump`,
 // which drops the board into DFU mode, and 0x0A is `id_eeprom_reset`.
+// Both stay deliberately unimplemented.
+const ID_GET_PROTOCOL_VERSION: u8 = 0x01;
 const ID_DYNAMIC_KEYMAP_GET_KEYCODE: u8 = 0x04;
 const ID_DYNAMIC_KEYMAP_SET_KEYCODE: u8 = 0x05;
 const ID_DYNAMIC_KEYMAP_GET_LAYER_COUNT: u8 = 0x11;
-// Lighting maps onto VIA's "custom value" channel: 0x07 sets, 0x08 gets.
+// Lighting maps onto VIA's "custom value" channel: 0x07 sets, 0x08 gets,
+// 0x09 persists a channel's values to the board's NVRAM.
 const ID_LIGHTING_SET_VALUE: u8 = 0x07; // id_custom_set_value
 const ID_LIGHTING_GET_VALUE: u8 = 0x08; // id_custom_get_value
-// Dynamic-keymap macro buffer: 0x0E reads, 0x0F writes.
+const ID_CUSTOM_SAVE: u8 = 0x09; // id_custom_save
+// Dynamic-keymap macro buffer: 0x0E reads, 0x0F writes; 0x0C/0x0D report
+// the slot count and total buffer size used for host-side bounds checks.
+const ID_MACRO_GET_COUNT: u8 = 0x0C; // id_dynamic_keymap_macro_get_count
+const ID_MACRO_GET_BUFFER_SIZE: u8 = 0x0D; // id_dynamic_keymap_macro_get_buffer_size
 const ID_MACRO_GET_BUFFER: u8 = 0x0E; // id_dynamic_keymap_macro_get_buffer
 const ID_MACRO_SET_BUFFER: u8 = 0x0F; // id_dynamic_keymap_macro_set_buffer
 
@@ -181,6 +196,27 @@ fn validate_echo(
     }
 }
 
+/// Validates a macro-buffer access range against the device-reported total
+/// buffer size.
+///
+/// **Context:** QMK stores the macro buffer in EEPROM; the firmware does not
+/// range-check `id_dynamic_keymap_macro_set_buffer` offsets, so an
+/// out-of-range write can clobber adjacent dynamic-keymap EEPROM. The host
+/// must therefore bound every access to `[0, buffer_size)` itself.
+fn validate_macro_range(offset: u16, len: usize, buffer_size: u16) -> Result<(), DriverError> {
+    if len > MAX_MACRO_CHUNK {
+        return Err(DriverError::ProtocolViolation {
+            reason: "macro chunk exceeds 28-byte frame capacity",
+        });
+    }
+    if offset as usize + len > buffer_size as usize {
+        return Err(DriverError::ProtocolViolation {
+            reason: "macro range exceeds device macro buffer size",
+        });
+    }
+    Ok(())
+}
+
 /// Builds a [`CoalescerOp`], sends it to the actor, and awaits the reply.
 ///
 /// **Context:** Collapses the otherwise-identical request/response dance
@@ -218,12 +254,49 @@ pub(crate) struct ViaTransport {
     fd: AsyncFd<OwnedFd>,
     device_id: Arc<str>,
     timeout: Duration,
+    /// Total macro-buffer size reported by `id_dynamic_keymap_macro_get_buffer_size`,
+    /// queried once on first macro access. A firmware compile-time constant,
+    /// not device state, so caching it does not violate the VIA-first
+    /// invariant (CLAUDE.md §1.1).
+    macro_buffer_size: Option<u16>,
 }
 
 impl ViaTransport {
     fn new(fd: OwnedFd, device_id: Arc<str>, timeout: Duration) -> Result<Self, DriverError> {
         let fd = AsyncFd::new(fd).map_err(DriverError::Io)?;
-        Ok(Self { fd, device_id, timeout })
+        Ok(Self { fd, device_id, timeout, macro_buffer_size: None })
+    }
+
+    /// Returns the total macro-buffer size, querying the firmware on first use.
+    async fn ensure_macro_buffer_size(&mut self) -> Result<u16, DriverError> {
+        if let Some(size) = self.macro_buffer_size {
+            return Ok(size);
+        }
+        let mut req = [0u8; VIA_FRAME_LEN];
+        req[0] = ID_MACRO_GET_BUFFER_SIZE;
+        let resp = self.roundtrip(req, "get_macro_buffer_size").await?;
+        validate_echo(
+            &resp,
+            &[ID_MACRO_GET_BUFFER_SIZE],
+            "command-id echo mismatch on get_macro_buffer_size",
+        )?;
+        let size = u16::from_be_bytes([resp[1], resp[2]]);
+        debug!(device_id = %self.device_id, size, "macro buffer size probed");
+        self.macro_buffer_size = Some(size);
+        Ok(size)
+    }
+
+    /// Number of macro slots the firmware exposes (`id_dynamic_keymap_macro_get_count`).
+    async fn get_macro_count(&mut self) -> Result<u8, DriverError> {
+        let mut req = [0u8; VIA_FRAME_LEN];
+        req[0] = ID_MACRO_GET_COUNT;
+        let resp = self.roundtrip(req, "get_macro_count").await?;
+        validate_echo(
+            &resp,
+            &[ID_MACRO_GET_COUNT],
+            "command-id echo mismatch on get_macro_count",
+        )?;
+        Ok(resp[1])
     }
 
     /// Issues one request frame and reads one response frame, bounded by
@@ -297,6 +370,35 @@ impl ViaTransport {
 
 #[async_trait]
 impl CoalescerTransport for ViaTransport {
+    async fn get_protocol_version(&mut self) -> Result<u16, DriverError> {
+        let mut req = [0u8; VIA_FRAME_LEN];
+        req[0] = ID_GET_PROTOCOL_VERSION;
+        let resp = self.roundtrip(req, "get_protocol_version").await?;
+        validate_echo(
+            &resp,
+            &[ID_GET_PROTOCOL_VERSION],
+            "command-id echo mismatch on get_protocol_version",
+        )?;
+        Ok(u16::from_be_bytes([resp[1], resp[2]]))
+    }
+
+    async fn custom_save(&mut self, channel: u8) -> Result<(), DriverError> {
+        let mut req = [0u8; VIA_FRAME_LEN];
+        req[0] = ID_CUSTOM_SAVE;
+        req[1] = channel;
+        let resp = self.roundtrip(req, "custom_save").await?;
+        // A firmware that does not handle saves for this channel overwrites
+        // the command byte with id_unhandled (0xFF); the echo check turns
+        // that into a ProtocolViolation instead of a silent non-save.
+        validate_echo(
+            &resp,
+            &[ID_CUSTOM_SAVE, channel],
+            "(cmd, channel) echo mismatch on custom_save",
+        )?;
+        debug!(device_id = %self.device_id, channel, "custom values saved to NVRAM");
+        Ok(())
+    }
+
     async fn get_keycode(&mut self, layer: u8, row: u8, col: u8) -> Result<u16, DriverError> {
         let mut req = [0u8; VIA_FRAME_LEN];
         req[0] = ID_DYNAMIC_KEYMAP_GET_KEYCODE;
@@ -361,11 +463,8 @@ impl CoalescerTransport for ViaTransport {
         // VIA replies with [cmd, off_hi, off_lo, size, <size bytes>]; a
         // single frame can carry at most MAX_MACRO_CHUNK payload bytes, and
         // the firmware rejects larger requests. Callers chunk larger reads.
-        if length as usize > MAX_MACRO_CHUNK {
-            return Err(DriverError::ProtocolViolation {
-                reason: "macro read length exceeds 28-byte frame capacity",
-            });
-        }
+        let buffer_size = self.ensure_macro_buffer_size().await?;
+        validate_macro_range(offset, length as usize, buffer_size)?;
         let mut req = [0u8; VIA_FRAME_LEN];
         req[0] = ID_MACRO_GET_BUFFER;
         let [off_hi, off_lo] = offset.to_be_bytes();
@@ -373,29 +472,31 @@ impl CoalescerTransport for ViaTransport {
         req[2] = off_lo;
         req[3] = length;
         let resp = self.roundtrip(req, "get_macro_buffer").await?;
-        // Protocol specifies we read `length` bytes after command echoes
-        // Actually VIA just returns the buffer starting at byte 4.
-        let mut result = Vec::with_capacity(length as usize);
-        let max_len = (length as usize).min(VIA_FRAME_LEN - 4);
-        result.extend_from_slice(&resp[4..4 + max_len]);
-        Ok(result)
+        validate_echo(
+            &resp,
+            &[ID_MACRO_GET_BUFFER, off_hi, off_lo, length],
+            "(cmd, offset, size) echo mismatch on get_macro_buffer",
+        )?;
+        // The requested bytes follow the echoed header at byte 4.
+        Ok(resp[4..4 + length as usize].to_vec())
     }
 
     async fn set_macro_buffer(&mut self, offset: u16, data: &[u8]) -> Result<(), DriverError> {
-        if data.len() > MAX_MACRO_CHUNK {
-            return Err(DriverError::ProtocolViolation {
-                reason: "macro write chunk exceeds 28-byte frame capacity",
-            });
-        }
+        let buffer_size = self.ensure_macro_buffer_size().await?;
+        validate_macro_range(offset, data.len(), buffer_size)?;
         let mut req = [0u8; VIA_FRAME_LEN];
         req[0] = ID_MACRO_SET_BUFFER;
         let [off_hi, off_lo] = offset.to_be_bytes();
         req[1] = off_hi;
         req[2] = off_lo;
-        let max_len = data.len().min(VIA_FRAME_LEN - 4);
-        req[3] = max_len as u8;
-        req[4..4 + max_len].copy_from_slice(&data[..max_len]);
-        self.roundtrip(req, "set_macro_buffer").await?;
+        req[3] = data.len() as u8;
+        req[4..4 + data.len()].copy_from_slice(data);
+        let resp = self.roundtrip(req, "set_macro_buffer").await?;
+        validate_echo(
+            &resp,
+            &[ID_MACRO_SET_BUFFER, off_hi, off_lo, data.len() as u8],
+            "(cmd, offset, size) echo mismatch on set_macro_buffer",
+        )?;
         Ok(())
     }
 
@@ -449,6 +550,7 @@ impl CoalescerTransport for ViaTransport {
 /// and by mock transports in tests.
 #[async_trait]
 pub(crate) trait CoalescerTransport: Send + Sync + 'static {
+    async fn get_protocol_version(&mut self) -> Result<u16, DriverError>;
     async fn get_keycode(&mut self, layer: u8, row: u8, col: u8) -> Result<u16, DriverError>;
     async fn set_keycode(
         &mut self,
@@ -458,6 +560,9 @@ pub(crate) trait CoalescerTransport: Send + Sync + 'static {
         keycode: u16,
     ) -> Result<(), DriverError>;
     async fn get_layer_count(&mut self) -> Result<u8, DriverError>;
+    /// Persists `channel`'s custom values to the board's NVRAM
+    /// (`id_custom_save`).
+    async fn custom_save(&mut self, channel: u8) -> Result<(), DriverError>;
     async fn get_macro_buffer(&mut self, offset: u16, length: u8) -> Result<Vec<u8>, DriverError>;
     async fn set_macro_buffer(&mut self, offset: u16, data: &[u8]) -> Result<(), DriverError>;
     async fn get_lighting(&mut self, channel: u8, value_id: u8) -> Result<Vec<u8>, DriverError>;
@@ -472,6 +577,9 @@ pub(crate) trait CoalescerTransport: Send + Sync + 'static {
 /// Commands sent into the coalescer actor.
 #[derive(Debug)]
 enum CoalescerOp {
+    GetProtocolVersion {
+        reply: oneshot::Sender<Result<u16, DriverError>>,
+    },
     GetKeycode {
         layer: u8,
         row: u8,
@@ -542,6 +650,13 @@ async fn run_coalescer<T: CoalescerTransport>(
 ) {
     let mut buffer: HashMap<(u8, u8, u8), u16> = HashMap::new();
     let mut deadline: Option<Instant> = None;
+    // Custom-value channels touched by SetLighting since the last successful
+    // save. `id_custom_set_value` applies to firmware RAM only; the explicit
+    // Flush (commit_to_nvram) issues one `id_custom_save` per touched channel
+    // so the values survive a power cycle. Auto-flush does NOT save lighting —
+    // saving is an EEPROM write, and coupling it to the keycode debounce would
+    // reintroduce the wear pattern the RAM-live set avoids.
+    let mut touched_channels: HashSet<u8> = HashSet::new();
     debug!(device_id = %device_id, ?flush_interval, "coalescer actor started");
 
     /// Emits a single `LayoutUpdated` event after a successful flush.
@@ -588,11 +703,24 @@ async fn run_coalescer<T: CoalescerTransport>(
                     CoalescerOp::GetLayerCount { reply } => {
                         let _ = reply.send(transport.get_layer_count().await);
                     }
+                    CoalescerOp::GetProtocolVersion { reply } => {
+                        let _ = reply.send(transport.get_protocol_version().await);
+                    }
                     CoalescerOp::Flush { reply } => {
                         let result = flush_buffer(&mut transport, &mut buffer).await;
                         if result.is_ok() {
                             emit_layout_updated(&lifecycle_tx, &device_id);
                         }
+                        // Persist touched lighting channels only once the
+                        // keymap drained cleanly; on failure the channels are
+                        // retained for the next commit.
+                        let result = match result {
+                            Ok(()) => {
+                                save_touched_channels(&mut transport, &mut touched_channels)
+                                    .await
+                            }
+                            err => err,
+                        };
                         deadline = None;
                         let _ = reply.send(result);
                     }
@@ -606,16 +734,28 @@ async fn run_coalescer<T: CoalescerTransport>(
                         let _ = reply.send(transport.get_lighting(channel, value_id).await);
                     }
                     CoalescerOp::SetLighting { channel, value_id, data, reply } => {
-                        let _ = reply.send(transport.set_lighting(channel, value_id, &data).await);
+                        let result = transport.set_lighting(channel, value_id, &data).await;
+                        if result.is_ok() {
+                            touched_channels.insert(channel);
+                        }
+                        let _ = reply.send(result);
                     }
                 }
             }
             _ = sleep_fut => {
                 match flush_buffer(&mut transport, &mut buffer).await {
-                    Ok(()) => emit_layout_updated(&lifecycle_tx, &device_id),
-                    Err(e) => warn!(device_id = %device_id, error = %e, "auto-flush failed"),
+                    Ok(()) => {
+                        emit_layout_updated(&lifecycle_tx, &device_id);
+                        deadline = None;
+                    }
+                    Err(e) => {
+                        // Failed entries were retained in the buffer; re-arm
+                        // the deadline so they retry on the next interval
+                        // instead of stranding until the next set/commit.
+                        warn!(device_id = %device_id, error = %e, "auto-flush failed; retrying next interval");
+                        deadline = Some(Instant::now() + flush_interval);
+                    }
                 }
-                deadline = None;
             }
         }
     }
@@ -627,6 +767,11 @@ async fn run_coalescer<T: CoalescerTransport>(
             Ok(()) => emit_layout_updated(&lifecycle_tx, &device_id),
             Err(e) => warn!(device_id = %device_id, error = %e, "final flush on shutdown failed"),
         }
+    }
+    if !touched_channels.is_empty()
+        && let Err(e) = save_touched_channels(&mut transport, &mut touched_channels).await
+    {
+        warn!(device_id = %device_id, error = %e, "final lighting save on shutdown failed");
     }
     debug!(device_id = %device_id, "coalescer actor exiting");
 }
@@ -653,6 +798,21 @@ async fn flush_buffer<T: CoalescerTransport>(
     Ok(())
 }
 
+/// Issues one `id_custom_save` per touched lighting channel, removing each
+/// channel on success. On the first error, the remaining channels are
+/// retained so a subsequent commit can retry them.
+async fn save_touched_channels<T: CoalescerTransport>(
+    transport: &mut T,
+    channels: &mut HashSet<u8>,
+) -> Result<(), DriverError> {
+    let pending: Vec<u8> = channels.iter().copied().collect();
+    for channel in pending {
+        transport.custom_save(channel).await?;
+        channels.remove(&channel);
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ViaDriver — the public facade
 // ─────────────────────────────────────────────────────────────────────────────
@@ -673,11 +833,22 @@ pub struct ViaDriver {
     inner: ViaInner,
     matrix: (u8, u8),
     device_id: Arc<str>,
+    /// Firmware-reported VIA protocol version (`id_get_protocol_version`),
+    /// probed on the first topology query and cached for the session. A
+    /// firmware constant, not device state, so caching does not violate the
+    /// VIA-first invariant.
+    protocol_version: Option<u16>,
 }
 
 enum ViaInner {
     /// VIA-first default: every call performs a fresh hidraw round-trip.
-    Direct(ViaTransport),
+    Direct {
+        transport: ViaTransport,
+        /// Custom-value channels touched by `set_lighting` since the last
+        /// `commit_to_nvram`. Sets apply to firmware RAM only; commit issues
+        /// one `id_custom_save` per touched channel so they persist.
+        touched_channels: HashSet<u8>,
+    },
     /// Opt-in coalescing mode: commands are forwarded to a background
     /// actor that owns the transport and buffers writes.
     Coalesced {
@@ -706,9 +877,13 @@ impl ViaDriver {
     pub fn new(hidraw_path: &Path, matrix: (u8, u8)) -> Result<Self, DriverError> {
         let (transport, device_id) = open_transport(hidraw_path)?;
         Ok(Self {
-            inner: ViaInner::Direct(transport),
+            inner: ViaInner::Direct {
+                transport,
+                touched_channels: HashSet::new(),
+            },
             matrix,
             device_id,
+            protocol_version: None,
         })
     }
 
@@ -752,21 +927,50 @@ impl ViaDriver {
             inner: ViaInner::Coalesced { op_tx, _actor: actor },
             matrix,
             device_id,
+            protocol_version: None,
         })
+    }
+
+    /// Probes and caches the firmware's VIA protocol version on first call.
+    ///
+    /// **Context:** Issued as part of the attach-time topology queries. VIA
+    /// protocol versions 0x09–0x0C are wire-compatible with every command
+    /// this driver issues, so the version is logged rather than gated; a
+    /// malformed response surfaces as [`DriverError::ProtocolViolation`] and
+    /// rejects the attach.
+    async fn ensure_protocol_version(&mut self) -> Result<u16, DriverError> {
+        if let Some(version) = self.protocol_version {
+            return Ok(version);
+        }
+        let version = match &mut self.inner {
+            ViaInner::Direct { transport, .. } => transport.get_protocol_version().await?,
+            ViaInner::Coalesced { op_tx, .. } => {
+                relay(op_tx, |reply| CoalescerOp::GetProtocolVersion { reply }).await?
+            }
+        };
+        info!(device_id = %self.device_id, version = format_args!("{version:#06x}"), "VIA protocol version probed");
+        self.protocol_version = Some(version);
+        Ok(version)
     }
 }
 
 #[async_trait]
 impl KeyboardDriver for ViaDriver {
     async fn get_matrix_dimensions(&mut self) -> Result<(u8, u8), DriverError> {
+        // Attach-time seam: the engine queries topology exactly once per
+        // session, so the protocol-version probe piggybacks here. A board
+        // that cannot answer `id_get_protocol_version` is rejected before
+        // any keymap traffic.
+        self.ensure_protocol_version().await?;
         // INVARIANT: matrix dimensions are immutable for the session and
         // were validated by the factory when ViaDriver was constructed.
         Ok(self.matrix)
     }
 
     async fn get_layer_count(&mut self) -> Result<u8, DriverError> {
+        self.ensure_protocol_version().await?;
         match &mut self.inner {
-            ViaInner::Direct(t) => t.get_layer_count().await,
+            ViaInner::Direct { transport, .. } => transport.get_layer_count().await,
             ViaInner::Coalesced { op_tx, .. } => {
                 relay(op_tx, |reply| CoalescerOp::GetLayerCount { reply }).await
             }
@@ -775,7 +979,7 @@ impl KeyboardDriver for ViaDriver {
 
     async fn get_keycode(&mut self, layer: u8, row: u8, col: u8) -> Result<u16, DriverError> {
         match &mut self.inner {
-            ViaInner::Direct(t) => t.get_keycode(layer, row, col).await,
+            ViaInner::Direct { transport, .. } => transport.get_keycode(layer, row, col).await,
             ViaInner::Coalesced { op_tx, .. } => {
                 relay(op_tx, |reply| CoalescerOp::GetKeycode { layer, row, col, reply }).await
             }
@@ -790,7 +994,9 @@ impl KeyboardDriver for ViaDriver {
         keycode: u16,
     ) -> Result<(), DriverError> {
         match &mut self.inner {
-            ViaInner::Direct(t) => t.set_keycode(layer, row, col, keycode).await,
+            ViaInner::Direct { transport, .. } => {
+                transport.set_keycode(layer, row, col, keycode).await
+            }
             ViaInner::Coalesced { op_tx, .. } => {
                 relay(op_tx, |reply| CoalescerOp::SetKeycode { layer, row, col, keycode, reply }).await
             }
@@ -799,7 +1005,7 @@ impl KeyboardDriver for ViaDriver {
 
     async fn get_macro_buffer(&mut self, offset: u16, length: u8) -> Result<Vec<u8>, DriverError> {
         match &mut self.inner {
-            ViaInner::Direct(t) => t.get_macro_buffer(offset, length).await,
+            ViaInner::Direct { transport, .. } => transport.get_macro_buffer(offset, length).await,
             ViaInner::Coalesced { op_tx, .. } => {
                 relay(op_tx, |reply| CoalescerOp::GetMacro { offset, length, reply }).await
             }
@@ -808,7 +1014,7 @@ impl KeyboardDriver for ViaDriver {
 
     async fn set_macro_buffer(&mut self, offset: u16, data: &[u8]) -> Result<(), DriverError> {
         match &mut self.inner {
-            ViaInner::Direct(t) => t.set_macro_buffer(offset, data).await,
+            ViaInner::Direct { transport, .. } => transport.set_macro_buffer(offset, data).await,
             ViaInner::Coalesced { op_tx, .. } => {
                 let data = data.to_vec();
                 relay(op_tx, |reply| CoalescerOp::SetMacro { offset, data, reply }).await
@@ -818,7 +1024,7 @@ impl KeyboardDriver for ViaDriver {
 
     async fn get_lighting(&mut self, channel: u8, value_id: u8) -> Result<Vec<u8>, DriverError> {
         match &mut self.inner {
-            ViaInner::Direct(t) => t.get_lighting(channel, value_id).await,
+            ViaInner::Direct { transport, .. } => transport.get_lighting(channel, value_id).await,
             ViaInner::Coalesced { op_tx, .. } => {
                 relay(op_tx, |reply| CoalescerOp::GetLighting { channel, value_id, reply }).await
             }
@@ -832,7 +1038,11 @@ impl KeyboardDriver for ViaDriver {
         data: &[u8],
     ) -> Result<(), DriverError> {
         match &mut self.inner {
-            ViaInner::Direct(t) => t.set_lighting(channel, value_id, data).await,
+            ViaInner::Direct { transport, touched_channels } => {
+                transport.set_lighting(channel, value_id, data).await?;
+                touched_channels.insert(channel);
+                Ok(())
+            }
             ViaInner::Coalesced { op_tx, .. } => {
                 let data = data.to_vec();
                 relay(op_tx, |reply| CoalescerOp::SetLighting { channel, value_id, data, reply }).await
@@ -842,10 +1052,14 @@ impl KeyboardDriver for ViaDriver {
 
     async fn commit_to_nvram(&mut self) -> Result<(), DriverError> {
         match &mut self.inner {
-            // Unbuffered VIA: every `set_keycode` already persisted via
-            // the firmware's `eeprom_update_byte` call. Nothing to flush.
-            ViaInner::Direct(_) => Ok(()),
-            // Coalescing VIA: drain the buffer through the transport.
+            // Unbuffered VIA: every `set_keycode` already persisted via the
+            // firmware's `eeprom_update_byte` call. Only lighting needs a
+            // commit step — custom values apply to RAM until id_custom_save.
+            ViaInner::Direct { transport, touched_channels } => {
+                save_touched_channels(transport, touched_channels).await
+            }
+            // Coalescing VIA: drain the buffer through the transport, then
+            // save touched lighting channels (handled by the Flush op).
             ViaInner::Coalesced { op_tx, .. } => {
                 relay(op_tx, |reply| CoalescerOp::Flush { reply }).await
             }
@@ -853,7 +1067,7 @@ impl KeyboardDriver for ViaDriver {
     }
 
     fn emits_layout_event_per_set(&self) -> bool {
-        matches!(self.inner, ViaInner::Direct(_))
+        matches!(self.inner, ViaInner::Direct { .. })
     }
 }
 
@@ -1113,13 +1327,43 @@ mod tests {
         // revision had ID_MACRO_GET_BUFFER = 0x0B, which would have
         // dropped the board into DFU mode on a read. This test pins the
         // values so that regression cannot recur silently.
+        assert_eq!(ID_GET_PROTOCOL_VERSION, 0x01, "id_get_protocol_version");
         assert_eq!(ID_DYNAMIC_KEYMAP_GET_KEYCODE, 0x04);
         assert_eq!(ID_DYNAMIC_KEYMAP_SET_KEYCODE, 0x05);
         assert_eq!(ID_LIGHTING_SET_VALUE, 0x07, "id_custom_set_value");
         assert_eq!(ID_LIGHTING_GET_VALUE, 0x08, "id_custom_get_value");
+        assert_eq!(ID_CUSTOM_SAVE, 0x09, "id_custom_save");
+        assert_eq!(ID_MACRO_GET_COUNT, 0x0C, "id_dynamic_keymap_macro_get_count");
+        assert_eq!(
+            ID_MACRO_GET_BUFFER_SIZE,
+            0x0D,
+            "id_dynamic_keymap_macro_get_buffer_size"
+        );
         assert_eq!(ID_MACRO_GET_BUFFER, 0x0E, "id_dynamic_keymap_macro_get_buffer");
         assert_eq!(ID_MACRO_SET_BUFFER, 0x0F, "id_dynamic_keymap_macro_set_buffer");
         assert_eq!(ID_DYNAMIC_KEYMAP_GET_LAYER_COUNT, 0x11);
+    }
+
+    #[test]
+    fn macro_range_validation() {
+        // Within bounds.
+        assert!(validate_macro_range(0, 28, 1024).is_ok());
+        assert!(validate_macro_range(1000, 24, 1024).is_ok());
+        // Chunk too large for one frame.
+        assert!(matches!(
+            validate_macro_range(0, 29, 1024),
+            Err(DriverError::ProtocolViolation { .. })
+        ));
+        // Past the end of the device buffer.
+        assert!(matches!(
+            validate_macro_range(1020, 5, 1024),
+            Err(DriverError::ProtocolViolation { .. })
+        ));
+        // Degenerate zero-size buffer rejects any non-empty access.
+        assert!(matches!(
+            validate_macro_range(0, 1, 0),
+            Err(DriverError::ProtocolViolation { .. })
+        ));
     }
 
     #[test]
@@ -1186,6 +1430,8 @@ mod tests {
         Get(u8, u8, u8),
         Set(u8, u8, u8, u16),
         LayerCount,
+        SetLighting(u8, u8),
+        CustomSave(u8),
     }
 
     /// Adapter so the test can hand the mock to `run_coalescer` while
@@ -1194,6 +1440,14 @@ mod tests {
 
     #[async_trait]
     impl CoalescerTransport for SharedMock {
+        async fn get_protocol_version(&mut self) -> Result<u16, DriverError> {
+            Ok(0x000C)
+        }
+        async fn custom_save(&mut self, channel: u8) -> Result<(), DriverError> {
+            let mut m = self.0.lock().unwrap();
+            m.calls.push(MockCall::CustomSave(channel));
+            Ok(())
+        }
         async fn get_keycode(&mut self, layer: u8, row: u8, col: u8) -> Result<u16, DriverError> {
             let mut m = self.0.lock().unwrap();
             m.calls.push(MockCall::Get(layer, row, col));
@@ -1230,10 +1484,12 @@ mod tests {
         }
         async fn set_lighting(
             &mut self,
-            _channel: u8,
-            _value_id: u8,
+            channel: u8,
+            value_id: u8,
             _data: &[u8],
         ) -> Result<(), DriverError> {
+            let mut m = self.0.lock().unwrap();
+            m.calls.push(MockCall::SetLighting(channel, value_id));
             Ok(())
         }
     }
@@ -1509,12 +1765,94 @@ mod tests {
         send_flush(&tx).await.unwrap();
 
         // The remaining entries should have been successfully flushed this time.
-        // We know (0,0,1) failed the first time. The other two may or may not have 
+        // We know (0,0,1) failed the first time. The other two may or may not have
         // been attempted during the first flush because HashMap iteration order is random.
         // But after the second successful flush, ALL THREE MUST be in storage.
         let m = mock.lock().unwrap();
         assert_eq!(m.storage.get(&(0, 0, 0)), Some(&0x01));
         assert_eq!(m.storage.get(&(0, 0, 1)), Some(&0x02));
         assert_eq!(m.storage.get(&(0, 0, 2)), Some(&0x03));
+    }
+
+    /// Helper: send a SetLighting op and await the reply.
+    async fn send_set_lighting(
+        tx: &mpsc::Sender<CoalescerOp>,
+        channel: u8,
+        value_id: u8,
+    ) -> Result<(), DriverError> {
+        let (rtx, rrx) = oneshot::channel();
+        tx.send(CoalescerOp::SetLighting { channel, value_id, data: vec![0x7F], reply: rtx })
+            .await
+            .unwrap();
+        rrx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn flush_saves_touched_lighting_channels_once() {
+        let (tx, mock, _actor, _rx) = spawn_test_coalescer(Duration::from_secs(60));
+
+        // Two sets on the same channel, one on another: the save must be
+        // per-channel, not per-set.
+        send_set_lighting(&tx, 3, 1).await.unwrap(); // rgb-matrix brightness
+        send_set_lighting(&tx, 3, 3).await.unwrap(); // rgb-matrix speed
+        send_set_lighting(&tx, 2, 1).await.unwrap(); // rgblight brightness
+
+        // No save before the commit.
+        assert!(
+            !mock.lock().unwrap().calls.iter().any(|c| matches!(c, MockCall::CustomSave(_))),
+            "set_lighting alone must not persist to NVRAM"
+        );
+
+        send_flush(&tx).await.unwrap();
+        {
+            let m = mock.lock().unwrap();
+            let saves: Vec<u8> = m
+                .calls
+                .iter()
+                .filter_map(|c| match c {
+                    MockCall::CustomSave(ch) => Some(*ch),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(saves.len(), 2, "one save per touched channel, calls={:?}", m.calls);
+            assert!(saves.contains(&3) && saves.contains(&2));
+        }
+
+        // Channels were cleared by the successful save: a second flush must
+        // not save again.
+        send_flush(&tx).await.unwrap();
+        let m = mock.lock().unwrap();
+        assert_eq!(
+            m.calls.iter().filter(|c| matches!(c, MockCall::CustomSave(_))).count(),
+            2,
+            "no repeat saves after a successful commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_auto_flush_retries_on_next_interval() {
+        let (tx, mock, _actor, _rx) = spawn_test_coalescer(Duration::from_millis(50));
+        // The write fails on the first auto-flush attempt…
+        mock.lock().unwrap().fail_on_set = Some((1, 2, 3));
+        send_set(&tx, 1, 2, 3, 0xABCD).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            mock.lock().unwrap().storage.is_empty(),
+            "first auto-flush should have failed"
+        );
+
+        // …then the fault clears; the re-armed deadline must retry without
+        // any further Set/Flush traffic.
+        mock.lock().unwrap().fail_on_set = None;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let m = mock.lock().unwrap();
+        assert_eq!(
+            m.storage.get(&(1, 2, 3)),
+            Some(&0xABCD),
+            "retained entry should flush on the retried interval; calls={:?}",
+            m.calls,
+        );
     }
 }
