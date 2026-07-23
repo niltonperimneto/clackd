@@ -4,7 +4,7 @@
 //!
 //! # Purpose
 //!
-//! Non-VIA keyboards (GMK67-family, and future Logitech/Razer backends) cannot
+//! Non-VIA keyboards (GMK67-family, Logitech G-series, and future Razer backends) cannot
 //! be queried for their current keymap over USB. Instead, the daemon maintains
 //! a **shadow state** — a JSON-serialized cache of every keycode the host has
 //! written — and compiles it into a vendor-specific binary blob on commit.
@@ -36,6 +36,7 @@
 //! `Failed`. The engine never observes stale state through `get_keycode`.
 
 pub mod gmk67;
+pub mod logitech;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -115,6 +116,72 @@ impl Default for LightingState {
             random: false,
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VIA custom-value compatibility layer (shared by legacy drivers)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The VIA driver exposes lighting as `(channel, value_id)` custom values
+// (QMK `via.h`: channel 3 = RGB matrix; value ids below). Legacy drivers
+// accept the same addressing so frontends can drive every backend through one
+// code path; channel 0 stays reserved for each driver's native packed payload.
+
+/// `id_custom_channel` — driver-native packed format.
+pub(crate) const VIA_CHANNEL_PACKED: u8 = 0;
+/// `id_qmk_rgb_matrix_channel`.
+pub(crate) const VIA_CHANNEL_RGB_MATRIX: u8 = 3;
+/// `id_qmk_rgb_matrix_brightness`.
+pub(crate) const VIA_VALUE_BRIGHTNESS: u8 = 1;
+/// `id_qmk_rgb_matrix_effect`.
+pub(crate) const VIA_VALUE_EFFECT: u8 = 2;
+/// `id_qmk_rgb_matrix_effect_speed`.
+pub(crate) const VIA_VALUE_SPEED: u8 = 3;
+/// `id_qmk_rgb_matrix_color` (hue, sat).
+pub(crate) const VIA_VALUE_COLOR: u8 = 4;
+
+/// Integer HSV→RGB at full value, hue and saturation in VIA's 0–255 range.
+/// Mirrors QMK's `hsv_to_rgb` so a colour set through the VIA channel looks
+/// the same on a legacy board as on native VIA hardware.
+pub(crate) fn hs_to_rgb(h: u8, s: u8) -> (u8, u8, u8) {
+    if s == 0 {
+        return (255, 255, 255);
+    }
+    let region = h / 43;
+    let remainder = (h as u16 - region as u16 * 43) * 6;
+    let s = s as u16;
+    let p = (255 * (255 - s) / 255) as u8;
+    let q = (255 * (255 - (s * remainder) / 255) / 255) as u8;
+    let t = (255 * (255 - (s * (255 - remainder)) / 255) / 255) as u8;
+    match region {
+        0 => (255, t, p),
+        1 => (q, 255, p),
+        2 => (p, 255, t),
+        3 => (p, q, 255),
+        4 => (t, p, 255),
+        _ => (255, p, q),
+    }
+}
+
+/// Integer RGB→(hue, sat) in VIA's 0–255 range; the inverse direction for
+/// `get_lighting` reads of a colour stored as RGB in the shadow.
+pub(crate) fn rgb_to_hs(r: u8, g: u8, b: u8) -> (u8, u8) {
+    let max = r.max(g).max(b) as i32;
+    let min = r.min(g).min(b) as i32;
+    let delta = max - min;
+    if max == 0 || delta == 0 {
+        return (0, 0);
+    }
+    let s = (delta * 255 / max) as u8;
+    let (r, g, b) = (r as i32, g as i32, b as i32);
+    let h = if r == max {
+        43 * (g - b) / delta
+    } else if g == max {
+        85 + 43 * (b - r) / delta
+    } else {
+        171 + 43 * (r - g) / delta
+    };
+    (h.rem_euclid(256) as u8, s)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

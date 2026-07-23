@@ -47,6 +47,7 @@ use engine::{
     DaemonError, DriverTable, LifecycleEvent, ENGINE_CHANNEL_CAPACITY, LIFECYCLE_CHANNEL_CAPACITY,
 };
 use hal::legacy::gmk67::Gmk67Driver;
+use hal::legacy::logitech::LogitechDriver;
 use hal::via::ViaDriver;
 use hal::KeyboardDriver;
 
@@ -174,8 +175,8 @@ struct DeviceConfig {
     /// If set, overrides the layer count queried from firmware.
     #[allow(dead_code)]
     layer_count_override: Option<u8>,
-    /// Driver backend for this device: `"via"` (default) or `"gmk67"`.
-    /// Selects the vendor HAL driver in [`build_driver_table`].
+    /// Driver backend for this device: `"via"` (default), `"gmk67"`, or
+    /// `"logitech"`. Selects the vendor HAL driver in [`build_driver_table`].
     #[serde(default)]
     driver: Option<String>,
     /// GMK67 only: read the keymap back from the device at attach and adopt
@@ -238,6 +239,7 @@ fn build_driver_table() -> DriverTable {
                                     warn!("driver = \"epomaker\" is deprecated; rename it to \"gmk67\" in devices.toml");
                                     gmk67_factory
                                 }
+                                "logitech" => logitech_factory,
                                 "via" => via_fallback_factory,
                                 other => {
                                     warn!(driver = other, "unknown driver backend — defaulting to via");
@@ -359,6 +361,26 @@ static GMK67_SYNC_ON_ATTACH: std::sync::atomic::AtomicBool =
 fn gmk67_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
     let sync = GMK67_SYNC_ON_ATTACH.load(std::sync::atomic::Ordering::Relaxed);
     Ok(Box::new(Gmk67Driver::new(hidraw_path, EK68_MATRIX, EK68_LAYERS, sync)?))
+}
+
+/// G915 G-key topology for the Logitech HID++ driver: one row of five
+/// G-keys (G1–G5), three layers for the M1/M2/M3 banks. Only the G-keys are
+/// remappable through onboard profiles, so the matrix covers exactly them
+/// (docs/protocol/logitech-g915-hidpp.md §5.3). The device offers no
+/// topology query for this area.
+const G915_MATRIX: (u8, u8) = (1, 5);
+const G915_LAYERS: u8 = 3;
+
+/// Factory for the Logitech HID++ 2.0 (G915 / Lightspeed) vendor driver.
+///
+/// **Context:** Selected for a `(vid, pid)` whose `devices.toml` entry sets
+/// `driver = "logitech"` — typically the Lightspeed receiver's VID/PID
+/// (`046d:c541` for the G915 bundle), or the keyboard's own PID when
+/// cabled. Binds the HID++ vendor interface (the `LogitechDriver::new`
+/// probe rejects the composite device's other hidraw nodes); the HID++
+/// handshake itself runs at the engine's attach-time topology query.
+fn logitech_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
+    Ok(Box::new(LogitechDriver::new(hidraw_path, G915_MATRIX, G915_LAYERS)?))
 }
 
 /// Emits `READY=1` to the systemd notification socket.
