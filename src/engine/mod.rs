@@ -1389,7 +1389,7 @@ mod tests {
 
     fn protocol_violation_factory(_path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
         Err(DaemonError::Driver(DriverError::ProtocolViolation {
-            reason: "no VIA Usage Page (0xFF60) in HID descriptor".into(),
+            reason: "no VIA Usage Page (0xFF60) in HID descriptor",
         }))
     }
 

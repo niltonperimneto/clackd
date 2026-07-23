@@ -95,7 +95,10 @@ use nix::sys::stat::Mode;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use super::{LightingState, ShadowState};
+use super::{
+    LightingState, ShadowState, VIA_CHANNEL_PACKED, VIA_CHANNEL_RGB_MATRIX, VIA_VALUE_BRIGHTNESS,
+    VIA_VALUE_COLOR, VIA_VALUE_EFFECT, VIA_VALUE_SPEED, hs_to_rgb, rgb_to_hs,
+};
 use crate::hal::{DriverError, KeyboardDriver};
 
 /// USB identifiers for the EK68 (non-VIA). Reports as "Apple" — a spoof;
@@ -156,18 +159,14 @@ const SPEED_MAX: u8 = 0x0F;
 
 // --- VIA custom-value compatibility layer ------------------------------------
 //
-// The VIA driver exposes lighting as `(channel, value_id)` custom values
-// (QMK `via.h`: channel 3 = RGB matrix; value ids below). To let frontends
-// drive both backends through one code path, `set_lighting`/`get_lighting`
-// accept the same addressing here and patch the corresponding field of the
-// shadow [`Lighting`] before re-rendering the full transaction. Channel 0
-// keeps the driver-native packed `[mode, r, g, b, ...]` payload.
-const VIA_CHANNEL_PACKED: u8 = 0; // id_custom_channel — driver-native packed format
-const VIA_CHANNEL_RGB_MATRIX: u8 = 3; // id_qmk_rgb_matrix_channel
-const VIA_VALUE_BRIGHTNESS: u8 = 1; // id_qmk_rgb_matrix_brightness
-const VIA_VALUE_EFFECT: u8 = 2; // id_qmk_rgb_matrix_effect
-const VIA_VALUE_SPEED: u8 = 3; // id_qmk_rgb_matrix_effect_speed
-const VIA_VALUE_COLOR: u8 = 4; // id_qmk_rgb_matrix_color (hue, sat)
+// The `(channel, value_id)` addressing constants and the HSV↔RGB conversions
+// are shared across legacy drivers and live in the parent module
+// (`super::VIA_CHANNEL_*` / `super::hs_to_rgb` / `super::rgb_to_hs`).
+// `set_lighting`/`get_lighting` accept that addressing here and patch the
+// corresponding field of the shadow [`Lighting`] before re-rendering the full
+// transaction. Channel 0 keeps the driver-native packed `[mode, r, g, b, ...]`
+// payload. The 0–255 ↔ 0x00–0x0F scaling below stays local — the range is a
+// GMK67 hardware property.
 
 /// Scales a VIA 0–255 value onto the GMK67 0x00–0x0F range, rounding to
 /// nearest so 255 maps to 0x0F and 128 to 0x08.
@@ -178,50 +177,6 @@ fn scale_255_to_15(v: u8) -> u8 {
 /// Inverse of [`scale_255_to_15`]; 0x0F maps back to 255.
 fn scale_15_to_255(v: u8) -> u8 {
     (v.min(0x0F) as u16 * 255 / 15) as u8
-}
-
-/// Integer HSV→RGB at full value, hue and saturation in VIA's 0–255 range.
-/// Mirrors QMK's `hsv_to_rgb` so a colour set through the VIA channel looks
-/// the same on this board as on native VIA hardware.
-fn hs_to_rgb(h: u8, s: u8) -> (u8, u8, u8) {
-    if s == 0 {
-        return (255, 255, 255);
-    }
-    let region = h / 43;
-    let remainder = (h as u16 - region as u16 * 43) * 6;
-    let s = s as u16;
-    let p = (255 * (255 - s) / 255) as u8;
-    let q = (255 * (255 - (s * remainder) / 255) / 255) as u8;
-    let t = (255 * (255 - (s * (255 - remainder)) / 255) / 255) as u8;
-    match region {
-        0 => (255, t, p),
-        1 => (q, 255, p),
-        2 => (p, 255, t),
-        3 => (p, q, 255),
-        4 => (t, p, 255),
-        _ => (255, p, q),
-    }
-}
-
-/// Integer RGB→(hue, sat) in VIA's 0–255 range; the inverse direction for
-/// `get_lighting` reads of a colour stored as RGB in the shadow.
-fn rgb_to_hs(r: u8, g: u8, b: u8) -> (u8, u8) {
-    let max = r.max(g).max(b) as i32;
-    let min = r.min(g).min(b) as i32;
-    let delta = max - min;
-    if max == 0 || delta == 0 {
-        return (0, 0);
-    }
-    let s = (delta * 255 / max) as u8;
-    let (r, g, b) = (r as i32, g as i32, b as i32);
-    let h = if r == max {
-        43 * (g - b) / delta
-    } else if g == max {
-        85 + 43 * (b - r) / delta
-    } else {
-        171 + 43 * (r - g) / delta
-    };
-    (h.rem_euclid(256) as u8, s)
 }
 
 /// Whether `mode` is a renderable whole-keyboard mode this driver accepts.

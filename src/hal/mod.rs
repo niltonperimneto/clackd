@@ -55,7 +55,15 @@
 //!
 //! - `via.rs` — QMK/VIA native raw-HID implementation.
 //! - `legacy/` — shadow-state polyfill drivers for non-VIA hardware
-//!   (TODO mission-4; vendor protocol research pending).
+//!   (mission-4). `legacy/mod.rs` owns the shared [`ShadowState`] machine
+//!   (JSON persistence, dirty tracking, commit/rollback) plus the VIA
+//!   custom-value compatibility helpers; `legacy/gmk67.rs` drives the
+//!   GMK67-family boards (hardware-confirmed), `legacy/logitech.rs` drives
+//!   Logitech G915/Lightspeed over HID++ 2.0 (**experimental** — gated
+//!   behind `experimental = true` in `devices.toml` until the protocol
+//!   record is hardware-confirmed). A Razer backend completes the mission.
+//!
+//! [`ShadowState`]: legacy::ShadowState
 
 use std::path::PathBuf;
 
