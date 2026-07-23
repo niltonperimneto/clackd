@@ -198,7 +198,7 @@ clackctl monitor
 | 1 — Foundation | ✅ Complete | Error boundaries, HAL trait contract, module skeleton |
 | 2 — Engine | ✅ Complete | Device supervisor, topology structs, worker lifecycles, `EngineCommand` routing |
 | 3 — IPC & VIA Driver | ✅ Complete | D-Bus session gateway, `clackctl` CLI, native `hidraw` VIA driver |
-| 4 — Legacy Polyfill | 🚧 In progress | Shadow-state machine ✅, GMK67 driver ✅, Logitech (G915/Lightspeed) blob compiler ✅ — Razer pending |
+| 4 — Legacy Polyfill | 🚧 In progress | Shadow-state machine ✅, GMK67 driver ✅, Logitech (G915/Lightspeed) blob compiler 🧪 experimental opt-in — Razer pending |
 | 5 — Symbolic keycodes | 🔲 Planned | `KC_A`-style name table for frontends |
 | 6 — Profile management | 🔲 Planned | Named profiles, import/export, per-application hot-swap |
 

@@ -75,6 +75,51 @@
 //! reads the active profile sector back and — when its CRC checks out —
 //! adopts the decoded G-key bindings as the confirmed baseline, mirroring
 //! the GMK67 `sync_eeprom` parity.
+//!
+//! # Stability — EXPERIMENTAL, opt-in only
+//!
+//! Nothing in this module has been exercised against physical hardware.
+//! The backend is therefore **gated**: `build_driver_table` (src/main.rs)
+//! only selects it when the `devices.toml` entry sets both
+//! `driver = "logitech"` and `experimental = true`; without the flag the
+//! entry falls back to VIA (whose usage-page probe rejects the node,
+//! leaving the device untouched). Two safety rails limit the blast radius
+//! for testers: commits are *refused* (`VendorCompile`) unless a
+//! CRC-valid baseline sector was read from the device — the driver never
+//! fabricates a profile image — and a failed push rolls the shadow back to
+//! last-known-good. Remove the gate only once the doc's status table has
+//! flipped to hardware-confirmed.
+//!
+//! # Future Work (leads for the next iterations)
+//!
+//! Ranked roughly by value; the protocol doc §8 carries the wire-level
+//! detail for each:
+//!
+//! 1. **Hardware confirmation.** Capture a G HUB G-key remap and a
+//!    lighting change on a real G915; the G-key slot layout
+//!    ([`GKEY_BANK_BASE`]/[`GKEY_BANK_STRIDE`]) and the
+//!    `setClusterEffect` parameter order are the two provisional guesses.
+//!    Both sit behind pure functions, so corrections are constants-only.
+//! 2. **Macros.** Onboard profiles reserve macro sectors and the binding
+//!    table has a macro type; wiring them to
+//!    `get_macro_buffer`/`set_macro_buffer` (currently `NotSupported`)
+//!    would complete the VIA surface.
+//! 3. **Effect-table discovery.** `getInfo` (`0x8071` fn `0x0`) enumerates
+//!    each cluster's real effect list; today the `mode` byte is a raw
+//!    effect index. Discovering the table would let the driver map VIA
+//!    effect ids robustly and address clusters beyond
+//!    [`RGB_CLUSTER_PRIMARY`].
+//! 4. **Receiver arrival notifications.** Device-arrival (`0x41`) frames
+//!    are currently skipped by the reply matcher; surfacing them to the
+//!    supervisor would re-attach a keyboard the moment it powers on
+//!    instead of waiting out the exponential backoff.
+//! 5. **Battery surface.** Features `0x1000`/`0x1004` are one call each;
+//!    needs a trait-level home first (the VIA contract has none).
+//! 6. **Profile management.** Only the *active* profile sector is edited.
+//!    The profile directory (sector 0) plus `setCurrentProfile` are the
+//!    natural backend for mission 6 (named profiles / hot-swap).
+//! 7. **Very-long reports (`0x12`).** Some newer firmwares prefer the
+//!    64-byte report; the transport reads it but never transmits one.
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};

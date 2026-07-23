@@ -186,6 +186,17 @@ struct DeviceConfig {
     /// shadow; it never blocks the attach.
     #[serde(default)]
     sync_on_attach: bool,
+    /// Opt-in gate for backends that are not yet hardware-verified.
+    /// Currently required by `driver = "logitech"`: its HID++ wire formats
+    /// are assembled from public reverse engineering
+    /// (docs/protocol/logitech-g915-hidpp.md) and nothing has been
+    /// confirmed against a physical board, so the backend only engages for
+    /// testers who explicitly set `experimental = true` on the `[[device]]`
+    /// entry. Without it the entry falls back to the VIA driver (whose
+    /// usage-page probe will reject non-VIA nodes, leaving the device
+    /// safely untouched).
+    #[serde(default)]
+    experimental: bool,
 }
 
 /// Top-level structure for `$XDG_CONFIG_HOME/clackd/devices.toml`.
@@ -239,7 +250,22 @@ fn build_driver_table() -> DriverTable {
                                     warn!("driver = \"epomaker\" is deprecated; rename it to \"gmk67\" in devices.toml");
                                     gmk67_factory
                                 }
-                                "logitech" => logitech_factory,
+                                // Experimental gate: the HID++ protocol
+                                // record is hardware-unverified (doc §status),
+                                // so the backend requires an explicit
+                                // per-device opt-in from testers.
+                                "logitech" if dev.experimental => {
+                                    info!("logitech HID++ backend enabled (experimental opt-in — protocol pending hardware confirmation)");
+                                    logitech_factory
+                                }
+                                "logitech" => {
+                                    warn!(
+                                        "driver = \"logitech\" is experimental and disabled by default — \
+                                         add `experimental = true` to this [[device]] entry to test it; \
+                                         falling back to via"
+                                    );
+                                    via_fallback_factory
+                                }
                                 "via" => via_fallback_factory,
                                 other => {
                                     warn!(driver = other, "unknown driver backend — defaulting to via");
@@ -374,11 +400,14 @@ const G915_LAYERS: u8 = 3;
 /// Factory for the Logitech HID++ 2.0 (G915 / Lightspeed) vendor driver.
 ///
 /// **Context:** Selected for a `(vid, pid)` whose `devices.toml` entry sets
-/// `driver = "logitech"` — typically the Lightspeed receiver's VID/PID
-/// (`046d:c541` for the G915 bundle), or the keyboard's own PID when
-/// cabled. Binds the HID++ vendor interface (the `LogitechDriver::new`
-/// probe rejects the composite device's other hidraw nodes); the HID++
-/// handshake itself runs at the engine's attach-time topology query.
+/// `driver = "logitech"` **and** `experimental = true` — the backend is
+/// hardware-unverified and gated off by default (see the gate in
+/// [`build_driver_table`]). The entry typically carries the Lightspeed
+/// receiver's VID/PID (`046d:c541` for the G915 bundle), or the keyboard's
+/// own PID when cabled. Binds the HID++ vendor interface (the
+/// `LogitechDriver::new` probe rejects the composite device's other hidraw
+/// nodes); the HID++ handshake itself runs at the engine's attach-time
+/// topology query.
 fn logitech_factory(hidraw_path: &Path) -> Result<Box<dyn KeyboardDriver>, DaemonError> {
     Ok(Box::new(LogitechDriver::new(hidraw_path, G915_MATRIX, G915_LAYERS)?))
 }

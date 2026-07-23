@@ -159,12 +159,17 @@ is fully supported; key remapping is shadow-state with a vendor-blob commit (see
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="024f", TAG+="uaccess"
 ```
 
-### Non-VIA vendor drivers (Logitech G915 / Lightspeed)
+### Non-VIA vendor drivers (Logitech G915 / Lightspeed) — EXPERIMENTAL
 
 The `logitech` backend speaks HID++ 2.0 to a G915 through its Lightspeed
-receiver (or a cable). Point the entry at the USB identity the keyboard
-actually appears under — the receiver's for wireless (`046d:c541` for the
-G915 bundle; receiver PIDs vary per revision, check `lsusb`):
+receiver (or a cable). **It is not yet stable**: the protocol record is
+assembled from public reverse engineering and has not been confirmed
+against real hardware, so the backend only engages for testers who
+explicitly set `experimental = true` on the entry — without the flag the
+daemon logs a warning and leaves the device alone. Point the entry at the
+USB identity the keyboard actually appears under — the receiver's for
+wireless (`046d:c541` for the G915 bundle; receiver PIDs vary per
+revision, check `lsusb`):
 
 ```toml
 [[device]]
@@ -173,13 +178,15 @@ pid = 0xc541
 rows = 1
 cols = 5
 driver = "logitech"
+experimental = true   # required — backend is hardware-unverified
 ```
 
 Only the G-keys are remappable (matrix row 0, cols G1–G5; layers 0–2 are
 the M1/M2/M3 banks). Remaps are shadow-state with an onboard-profile blob
 commit; whole-keyboard RGB effects are supported (see
 `docs/protocol/logitech-g915-hidpp.md` — protocol pending hardware
-confirmation). The matching udev line:
+confirmation, including where the next iterations should pick up). The
+matching udev line:
 
 ```
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c541", TAG+="uaccess"

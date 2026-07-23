@@ -3,9 +3,11 @@
 Specification for the Logitech HID++ 2.0 protocol subset implemented by the
 clackd `logitech` driver
 ([`src/hal/legacy/logitech.rs`](../../src/hal/legacy/logitech.rs), selected
-with `driver = "logitech"` in `devices.toml`). The first target is the
-**G915 Lightspeed** keyboard reached **through its Lightspeed USB receiver**;
-a cable-connected board uses the same protocol at the wired device index.
+with `driver = "logitech"` **plus `experimental = true`** in `devices.toml`
+— the backend is gated off by default until this record is
+hardware-confirmed). The first target is the **G915 Lightspeed** keyboard
+reached **through its Lightspeed USB receiver**; a cable-connected board
+uses the same protocol at the wired device index.
 
 Unlike the GMK67 record, nothing below has been confirmed against physical
 hardware yet. Every section is assembled **from public reverse engineering** —
@@ -230,7 +232,37 @@ the transport's PID), `set_keycode` marks it dirty,
 the engine's 500 ms debounce triggers `commit_to_nvram`, and a failed push
 rolls the shadow back to last-known-good.
 
-## 8. Source attribution
+## 8. Leads for future iterations
+
+Mirroring the GMK67 record's "future lead" notes — each item names the
+wire-level entry point so the next iteration doesn't restart from zero.
+The module doc (`src/hal/legacy/logitech.rs`, "Future Work") ranks them.
+
+- **Hardware confirmation** (the gate-lifter): capture G HUB performing a
+  G-key remap and a lighting change. The two provisional guesses to check
+  first are the G-key slot layout (§5.3: base `0x20`, bank stride `0x40`)
+  and the `setClusterEffect` parameter order (§6). If the sector layout
+  moves, only `GKEY_BANK_BASE`/`GKEY_BANK_STRIDE`-family constants change.
+- **Macros**: `getDescription` reports a macro format id (§5.1) and
+  profiles reference macro sectors; the binding table has a macro type
+  besides `0x80` key bindings. Wire these to the VIA macro-buffer methods.
+- **Effect-table discovery**: `0x8071` `getInfo` (fn `0x0`) with
+  `[cluster, 0xFF, ...]`-style queries enumerates clusters and their
+  per-cluster effect lists, replacing today's raw effect-index passthrough
+  and enabling per-cluster addressing (keys vs. edge lighting).
+- **Receiver arrival notifications**: sub-id `0x41` (arrival) / `0x40`
+  (departure) frames on the receiver channel; today they classify as
+  `Ignore`. Feeding arrivals to the supervisor would replace backoff
+  polling with event-driven re-attach.
+- **Battery**: features `0x1000` (battery unified level) / `0x1004`
+  (unified battery) — blocked on a `KeyboardDriver` trait extension, not
+  on protocol work.
+- **Profile management**: sector 0 profile directory entries +
+  `setCurrentProfile` (§5.1) — the backend hook for mission 6.
+- **Very-long report `0x12`** (64 bytes): read-side handled, TX not
+  emitted; some newer firmwares prefer it for bulk transfers.
+
+## 9. Source attribution
 
 - **libratbag** (`src/hidpp20.c`, `src/driver-hidpp20.c`) — HID++ 2.0
   framing, error codes, Onboard Profiles functions, sector CRC, profile
